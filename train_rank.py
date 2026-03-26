@@ -44,6 +44,7 @@ def parse_args():
     # ── 模型选择 ────────────────────────────────────────────────────────────
     parser.add_argument('--model', type=str, default='mmoe', choices=list(MODEL_MAP.keys()), help='模型类型')
     parser.add_argument('--esmm', action='store_true', default=False, help='是否使用 ESMM 损失（pCTR × pCVR 监督购买标签）')
+    parser.add_argument('--sigmoid', type=int, default=1)
 
     # ── 通用超参数 ──────────────────────────────────────────────────────────
     parser.add_argument('--embedding_dim', type=int, default=32)
@@ -65,7 +66,7 @@ def parse_args():
     parser.add_argument('--expert_hidden_dims', type=int, nargs='+', default=[256, 128], help='每个专家网络各隐层维度（moe / mmoe / ple 有效）')
 
     # ── PLE 专用 ────────────────────────────────────────────────────────────
-    parser.add_argument('--num_specific_experts', type=int, default=2, help='每个任务专属专家数量（仅 ple 有效）')
+    parser.add_argument('--num_specific_experts', type=int, default=1, help='每个任务专属专家数量（仅 ple 有效）')
     parser.add_argument('--num_shared_experts', type=int, default=2, help='共享专家数量（仅 ple 有效）')
     parser.add_argument('--num_levels', type=int, default=2, help='CGC 层数（仅 ple 有效，>=1）')
 
@@ -79,7 +80,7 @@ def parse_args():
     parser.add_argument('--devices', type=int, default=4)
     parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_false')
     parser.add_argument('--log_every_n_steps', type=int, default=100)
-    parser.add_argument('--early_stop_patience', type=int, default=3)
+    parser.add_argument('--early_stop_patience', type=int, default=2)
 
     # ── 输出路径 ────────────────────────────────────────────────────────────
     parser.add_argument('--exp_dir', type=str, default='experiments/rank',
@@ -109,6 +110,7 @@ def build_model(args):
         use_torchjd          = args.use_torchjd,
         aggregation_method   = args.aggregation_method,
         esmm                 = args.esmm,
+        sigmoid              = args.sigmoid
     )
 
     # ShareBottom 专用参数

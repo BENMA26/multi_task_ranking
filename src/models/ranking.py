@@ -159,11 +159,13 @@ class _MultiTaskMixin:
         ctr_weight        : float,
         cvr_weight        : float,
         esmm              : bool = False,
+        sigmoid           : int = 1
     ):
         self.use_torchjd = use_torchjd
         self.ctr_weight  = ctr_weight
         self.cvr_weight  = cvr_weight
         self.esmm        = esmm
+        self.sigmoid     = sigmoid
         if use_torchjd:
             self.automatic_optimization = False
             self.aggregator = _create_aggregator(aggregation_method)
@@ -199,7 +201,10 @@ class _MultiTaskMixin:
         ctr_logits, cvr_logits = self(inputs)
 
         pCTR = torch.sigmoid(ctr_logits)
-        pCVR = torch.sigmoid(cvr_logits)
+        if self.sigmoid == 1:
+            pCVR = torch.sigmoid(cvr_logits)
+        else:
+            pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
 
         ctr_loss = nn.functional.binary_cross_entropy_with_logits(
             ctr_logits, ctr_labels.float()
@@ -368,11 +373,13 @@ class _MultiTaskMixin:
         ctr_weight        : float,
         cvr_weight        : float,
         esmm              : bool = False,
+        sigmoid           : int = 1
     ):
         self.use_torchjd = use_torchjd
         self.ctr_weight  = ctr_weight
         self.cvr_weight  = cvr_weight
         self.esmm        = esmm
+        self.sigmoid     = sigmoid
         if use_torchjd:
             self.automatic_optimization = False
             self.aggregator = _create_aggregator(aggregation_method)
@@ -408,7 +415,10 @@ class _MultiTaskMixin:
         ctr_logits, cvr_logits = self(inputs)
 
         pCTR = torch.sigmoid(ctr_logits)
-        pCVR = torch.sigmoid(cvr_logits)
+        if self.sigmoid == 1:
+            pCVR = torch.sigmoid(cvr_logits)
+        else:
+            pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
 
         ctr_loss = nn.functional.binary_cross_entropy_with_logits(
             ctr_logits, ctr_labels.float()
@@ -561,6 +571,7 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         use_torchjd         : bool      = False,
         aggregation_method  : str       = "upgrad",
         esmm                : bool      = False,
+        sigmoid             : int       = 1,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -577,7 +588,7 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(shared_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(shared_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid)
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor):
@@ -618,6 +629,7 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
         use_torchjd         : bool      = False,
         aggregation_method  : str       = "upgrad",
         esmm                : bool      = False,
+        sigmoid             : int       = 1,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -638,7 +650,7 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid)
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor):
@@ -681,6 +693,7 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         use_torchjd         : bool      = False,
         aggregation_method  : str       = "upgrad",
         esmm                : bool      = False,
+        sigmoid             : int       = 1,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -704,7 +717,7 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid)
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor):
@@ -775,6 +788,7 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
         use_torchjd          : bool      = False,
         aggregation_method   : str       = "upgrad",
         esmm                 : bool      = False,
+        sigmoid             : int       = 1,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -827,7 +841,7 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid)
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor):

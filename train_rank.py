@@ -58,6 +58,10 @@ def parse_args():
     parser.add_argument('--use_torchjd', action='store_true', default=False, help='是否启用 TorchJD 梯度聚合')
     parser.add_argument('--aggregation_method', type=str, default='upgrad', choices=['upgrad', 'mgda', 'pcgrad', 'graddrop'], help='TorchJD 聚合算法（use_torchjd=True 时生效）')
 
+    # ── Entropy 正则化（防止门控极化）────────────────────────────────────────
+    parser.add_argument('--use_entropy_reg', action='store_true', default=False, help='是否启用 Entropy 正则化防止门控极化')
+    parser.add_argument('--lambda_entropy', type=float, default=0.01, help='Entropy 正则化权重')
+
     # ── ShareBottom 专用 ────────────────────────────────────────────────────
     parser.add_argument('--shared_hidden_dims', type=int, nargs='+', default=[256, 128], help='共享底层各隐层维度（仅 share_bottom 有效）')
 
@@ -110,7 +114,9 @@ def build_model(args):
         use_torchjd          = args.use_torchjd,
         aggregation_method   = args.aggregation_method,
         esmm                 = args.esmm,
-        sigmoid              = args.sigmoid
+        sigmoid              = args.sigmoid,
+        use_entropy_reg      = args.use_entropy_reg,
+        lambda_entropy       = args.lambda_entropy,
     )
 
     # ShareBottom 专用参数

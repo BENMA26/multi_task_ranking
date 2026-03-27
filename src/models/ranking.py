@@ -54,7 +54,13 @@ class Expert(nn.Module):
         return self.network(x)
 
 class Gate(nn.Module):
-    """门控网络"""
+    """
+    门控网络
+
+    支持计算门控权重的 entropy，用于正则化防止极化问题。
+    极化问题：门控网络倾向于只选择少数几个专家，导致其他专家未被充分利用。
+    Entropy 正则化：鼓励门控权重分布更均匀，充分利用所有专家。
+    """
 
     def __init__(self, input_dim: int, num_experts: int):
         super().__init__()
@@ -63,8 +69,25 @@ class Gate(nn.Module):
             nn.Softmax(dim=1),
         )
 
-    def forward(self, x):
-        return self.gate(x)
+    def forward(self, x, return_entropy: bool = False):
+        """
+        Args:
+            x: [B, input_dim]
+            return_entropy: 是否返回 entropy（用于正则化）
+        Returns:
+            weights: [B, num_experts] 门控权重
+            entropy: [B] 每个样本的 entropy（可选）
+        """
+        weights = self.gate(x)  # [B, num_experts]
+
+        if return_entropy:
+            # 计算 entropy: H = -Σ p_i * log(p_i)
+            # 添加 eps 防止 log(0)
+            eps = 1e-8
+            entropy = -(weights * torch.log(weights + eps)).sum(dim=1)  # [B]
+            return weights, entropy
+
+        return weights
 
 class Tower(nn.Module):
     """任务塔"""
@@ -159,13 +182,24 @@ class _MultiTaskMixin:
         ctr_weight        : float,
         cvr_weight        : float,
         esmm              : bool = False,
-        sigmoid           : int = 1
+        sigmoid           : int = 1,
+        use_entropy_reg   : bool = False,
+        lambda_entropy    : float = 0.01,
     ):
+        """
+        初始化 TorchJD 梯度聚合和 Entropy 正则化参数
+
+        Args:
+            use_entropy_reg: 是否使用 Entropy 正则化防止门控极化
+            lambda_entropy: Entropy 正则化权重
+        """
         self.use_torchjd = use_torchjd
         self.ctr_weight  = ctr_weight
         self.cvr_weight  = cvr_weight
         self.esmm        = esmm
         self.sigmoid     = sigmoid
+        self.use_entropy_reg = use_entropy_reg
+        self.lambda_entropy  = lambda_entropy
         if use_torchjd:
             self.automatic_optimization = False
             self.aggregator = _create_aggregator(aggregation_method)
@@ -198,7 +232,13 @@ class _MultiTaskMixin:
         inputs, labels = batch
         ctr_labels = labels["click"]
         cvr_labels = labels["purchase"]
-        ctr_logits, cvr_logits = self(inputs)
+
+        # 如果启用 entropy 正则化，需要获取 gate entropy
+        if self.use_entropy_reg:
+            ctr_logits, cvr_logits, gate_entropy = self(inputs, return_gate_entropy=True)
+        else:
+            ctr_logits, cvr_logits = self(inputs)
+            gate_entropy = None
 
         pCTR = torch.sigmoid(ctr_logits)
         if self.sigmoid == 1:
@@ -223,26 +263,36 @@ class _MultiTaskMixin:
                 cvr_logits, cvr_labels.float()
             )
 
-        return ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss
+        # Entropy 正则化 loss
+        # 目标：最大化 entropy，即最小化 -entropy
+        # 因此 entropy_loss = -mean(entropy)
+        if self.use_entropy_reg and gate_entropy is not None:
+            entropy_loss = -gate_entropy.mean()  # 负号：最大化 entropy = 最小化 -entropy
+        else:
+            entropy_loss = torch.tensor(0.0, device=ctr_logits.device)
+
+        return ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss
 
     def _training_step_standard(self, batch):
-        _, _, _, _, ctr_loss, cvr_loss = self._compute_losses(batch)
-        loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss
-        self.log("train_loss",     loss,     prog_bar=True)
-        self.log("train_ctr_loss", ctr_loss)
-        self.log("train_cvr_loss", cvr_loss)
+        _, _, _, _, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss + self.lambda_entropy * entropy_loss
+        self.log("train_loss",         loss,         prog_bar=True)
+        self.log("train_ctr_loss",     ctr_loss)
+        self.log("train_cvr_loss",     cvr_loss)
+        self.log("train_entropy_loss", entropy_loss)
         return loss
 
     def _training_step_torchjd(self, batch):
         optimizer = self.optimizers()
         optimizer.zero_grad()
-        _, _, _, _, ctr_loss, cvr_loss = self._compute_losses(batch)
+        _, _, _, _, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
         backward([ctr_loss, cvr_loss], aggregator=self.aggregator)
         optimizer.step()
-        total_loss = ctr_loss + cvr_loss
-        self.log("train_loss",     total_loss, prog_bar=True)
-        self.log("train_ctr_loss", ctr_loss)
-        self.log("train_cvr_loss", cvr_loss)
+        total_loss = ctr_loss + cvr_loss + self.lambda_entropy * entropy_loss
+        self.log("train_loss",         total_loss,   prog_bar=True)
+        self.log("train_ctr_loss",     ctr_loss)
+        self.log("train_cvr_loss",     cvr_loss)
+        self.log("train_entropy_loss", entropy_loss)
         return total_loss
 
     # ------------------------------------------------------------------ #
@@ -373,13 +423,24 @@ class _MultiTaskMixin:
         ctr_weight        : float,
         cvr_weight        : float,
         esmm              : bool = False,
-        sigmoid           : int = 1
+        sigmoid           : int = 1,
+        use_entropy_reg   : bool = False,
+        lambda_entropy    : float = 0.01,
     ):
+        """
+        初始化 TorchJD 梯度聚合和 Entropy 正则化参数
+
+        Args:
+            use_entropy_reg: 是否使用 Entropy 正则化防止门控极化
+            lambda_entropy: Entropy 正则化权重
+        """
         self.use_torchjd = use_torchjd
         self.ctr_weight  = ctr_weight
         self.cvr_weight  = cvr_weight
         self.esmm        = esmm
         self.sigmoid     = sigmoid
+        self.use_entropy_reg = use_entropy_reg
+        self.lambda_entropy  = lambda_entropy
         if use_torchjd:
             self.automatic_optimization = False
             self.aggregator = _create_aggregator(aggregation_method)
@@ -412,7 +473,13 @@ class _MultiTaskMixin:
         inputs, labels = batch
         ctr_labels = labels["click"]
         cvr_labels = labels["purchase"]
-        ctr_logits, cvr_logits = self(inputs)
+
+        # 如果启用 entropy 正则化，需要获取 gate entropy
+        if self.use_entropy_reg:
+            ctr_logits, cvr_logits, gate_entropy = self(inputs, return_gate_entropy=True)
+        else:
+            ctr_logits, cvr_logits = self(inputs)
+            gate_entropy = None
 
         pCTR = torch.sigmoid(ctr_logits)
         if self.sigmoid == 1:
@@ -437,26 +504,36 @@ class _MultiTaskMixin:
                 cvr_logits, cvr_labels.float()
             )
 
-        return ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss
+        # Entropy 正则化 loss
+        # 目标：最大化 entropy，即最小化 -entropy
+        # 因此 entropy_loss = -mean(entropy)
+        if self.use_entropy_reg and gate_entropy is not None:
+            entropy_loss = -gate_entropy.mean()  # 负号：最大化 entropy = 最小化 -entropy
+        else:
+            entropy_loss = torch.tensor(0.0, device=ctr_logits.device)
+
+        return ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss
 
     def _training_step_standard(self, batch):
-        _, _, _, _, ctr_loss, cvr_loss = self._compute_losses(batch)
-        loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss
-        self.log("train_loss",     loss,     prog_bar=True)
-        self.log("train_ctr_loss", ctr_loss)
-        self.log("train_cvr_loss", cvr_loss)
+        _, _, _, _, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss + self.lambda_entropy * entropy_loss
+        self.log("train_loss",         loss,         prog_bar=True)
+        self.log("train_ctr_loss",     ctr_loss)
+        self.log("train_cvr_loss",     cvr_loss)
+        self.log("train_entropy_loss", entropy_loss)
         return loss
 
     def _training_step_torchjd(self, batch):
         optimizer = self.optimizers()
         optimizer.zero_grad()
-        _, _, _, _, ctr_loss, cvr_loss = self._compute_losses(batch)
+        _, _, _, _, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
         backward([ctr_loss, cvr_loss], aggregator=self.aggregator)
         optimizer.step()
-        total_loss = ctr_loss + cvr_loss
-        self.log("train_loss",     total_loss, prog_bar=True)
-        self.log("train_ctr_loss", ctr_loss)
-        self.log("train_cvr_loss", cvr_loss)
+        total_loss = ctr_loss + cvr_loss + self.lambda_entropy * entropy_loss
+        self.log("train_loss",         total_loss,   prog_bar=True)
+        self.log("train_ctr_loss",     ctr_loss)
+        self.log("train_cvr_loss",     cvr_loss)
+        self.log("train_entropy_loss", entropy_loss)
         return total_loss
 
     # ------------------------------------------------------------------ #
@@ -464,9 +541,9 @@ class _MultiTaskMixin:
     # ------------------------------------------------------------------ #
 
     def validation_step(self, batch, batch_idx):
-        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss = \
+        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = \
             self._compute_losses(batch)
-        loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss
+        loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss + self.lambda_entropy * entropy_loss
 
         # CTR AUC：全量曝光样本
         self.val_ctr_auc.update(torch.sigmoid(ctr_logits), ctr_labels.long())
@@ -479,9 +556,10 @@ class _MultiTaskMixin:
                 cvr_labels[click_mask].long()
             )
 
-        self.log("val_loss",     loss,     prog_bar=True, sync_dist=True)
-        self.log("val_ctr_loss", ctr_loss, sync_dist=True)
-        self.log("val_cvr_loss", cvr_loss, sync_dist=True)
+        self.log("val_loss",         loss,         prog_bar=True, sync_dist=True)
+        self.log("val_ctr_loss",     ctr_loss,     sync_dist=True)
+        self.log("val_cvr_loss",     cvr_loss,     sync_dist=True)
+        self.log("val_entropy_loss", entropy_loss, sync_dist=True)
         return loss
 
     def on_validation_epoch_end(self):
@@ -494,9 +572,9 @@ class _MultiTaskMixin:
         self.val_cvr_auc.reset()
 
     def test_step(self, batch, batch_idx):
-        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss = \
+        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = \
             self._compute_losses(batch)
-        loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss
+        loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss + self.lambda_entropy * entropy_loss
 
         # CTR AUC：全量曝光样本
         self.test_ctr_auc.update(torch.sigmoid(ctr_logits), ctr_labels.long())
@@ -509,9 +587,10 @@ class _MultiTaskMixin:
                 cvr_labels[click_mask].long()
             )
 
-        self.log("test_loss",     loss,     sync_dist=True)
-        self.log("test_ctr_loss", ctr_loss, sync_dist=True)
-        self.log("test_cvr_loss", cvr_loss, sync_dist=True)
+        self.log("test_loss",         loss,         sync_dist=True)
+        self.log("test_ctr_loss",     ctr_loss,     sync_dist=True)
+        self.log("test_cvr_loss",     cvr_loss,     sync_dist=True)
+        self.log("test_entropy_loss", entropy_loss, sync_dist=True)
         return loss
 
     def on_test_epoch_end(self):
@@ -630,6 +709,8 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
         aggregation_method  : str       = "upgrad",
         esmm                : bool      = False,
         sigmoid             : int       = 1,
+        use_entropy_reg     : bool      = False,
+        lambda_entropy      : float     = 0.01,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -650,14 +731,30 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_entropy_reg, lambda_entropy)
         self._init_metrics()
 
-    def _forward_logits(self, x: torch.Tensor):
+    def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
+        """
+        Args:
+            x: [B, input_dim]
+            return_gate_entropy: 是否返回 gate entropy（用于 entropy 正则化）
+        Returns:
+            ctr_logit: [B, 1]
+            cvr_logit: [B, 1]
+            gate_entropy: [B] gate entropy（可选）
+        """
         expert_outputs = torch.stack([e(x) for e in self.experts], dim=1)  # [B, E, d]
-        gate_weights   = self.gate(x).unsqueeze(-1)                        # [B, E, 1]
-        expert_out     = torch.sum(expert_outputs * gate_weights, dim=1)   # [B, d]
-        return self.ctr_tower(expert_out), self.cvr_tower(expert_out)
+
+        if return_gate_entropy:
+            gate_weights, gate_entropy = self.gate(x, return_entropy=True)  # [B, E], [B]
+            gate_weights = gate_weights.unsqueeze(-1)  # [B, E, 1]
+            expert_out = torch.sum(expert_outputs * gate_weights, dim=1)  # [B, d]
+            return self.ctr_tower(expert_out), self.cvr_tower(expert_out), gate_entropy
+        else:
+            gate_weights = self.gate(x).unsqueeze(-1)  # [B, E, 1]
+            expert_out = torch.sum(expert_outputs * gate_weights, dim=1)  # [B, d]
+            return self.ctr_tower(expert_out), self.cvr_tower(expert_out)
 
 class MMOEModel(_MultiTaskMixin, pl.LightningModule):
     """
@@ -694,6 +791,8 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         aggregation_method  : str       = "upgrad",
         esmm                : bool      = False,
         sigmoid             : int       = 1,
+        use_entropy_reg     : bool      = False,
+        lambda_entropy      : float     = 0.01,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -717,19 +816,41 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_entropy_reg, lambda_entropy)
         self._init_metrics()
 
-    def _forward_logits(self, x: torch.Tensor):
+    def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
+        """
+        Args:
+            x: [B, input_dim]
+            return_gate_entropy: 是否返回 gate entropy（用于 entropy 正则化）
+        Returns:
+            ctr_logit: [B, 1]
+            cvr_logit: [B, 1]
+            gate_entropy: [B] 平均 gate entropy（可选）
+        """
         expert_outputs = torch.stack([e(x) for e in self.experts], dim=1)  # [B, E, d]
 
-        ctr_weights = self.ctr_gate(x).unsqueeze(-1)                       # [B, E, 1]
-        ctr_out     = torch.sum(expert_outputs * ctr_weights, dim=1)
+        if return_gate_entropy:
+            ctr_weights, ctr_entropy = self.ctr_gate(x, return_entropy=True)  # [B, E], [B]
+            cvr_weights, cvr_entropy = self.cvr_gate(x, return_entropy=True)  # [B, E], [B]
+            ctr_weights = ctr_weights.unsqueeze(-1)  # [B, E, 1]
+            cvr_weights = cvr_weights.unsqueeze(-1)  # [B, E, 1]
 
-        cvr_weights = self.cvr_gate(x).unsqueeze(-1)
-        cvr_out     = torch.sum(expert_outputs * cvr_weights, dim=1)
+            ctr_out = torch.sum(expert_outputs * ctr_weights, dim=1)
+            cvr_out = torch.sum(expert_outputs * cvr_weights, dim=1)
 
-        return self.ctr_tower(ctr_out), self.cvr_tower(cvr_out)
+            # 返回两个 gate 的平均 entropy
+            avg_entropy = (ctr_entropy + cvr_entropy) / 2.0  # [B]
+            return self.ctr_tower(ctr_out), self.cvr_tower(cvr_out), avg_entropy
+        else:
+            ctr_weights = self.ctr_gate(x).unsqueeze(-1)  # [B, E, 1]
+            ctr_out = torch.sum(expert_outputs * ctr_weights, dim=1)
+
+            cvr_weights = self.cvr_gate(x).unsqueeze(-1)
+            cvr_out = torch.sum(expert_outputs * cvr_weights, dim=1)
+
+            return self.ctr_tower(ctr_out), self.cvr_tower(cvr_out)
 
 class PLEModel(_MultiTaskMixin, pl.LightningModule):
     """

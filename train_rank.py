@@ -92,7 +92,7 @@ def parse_args():
     parser.add_argument('--tau_max', type=float, default=0.50, help='AdaFTR 动态温度上界')
     parser.add_argument('--relatedness_hidden_dim', type=int, default=64, help='AdaFTR 关联性网络隐层维度')
     parser.add_argument('--lambda_rel', type=float, default=0.1, help='AdaFTR 关联性损失权重')
-    parser.add_argument('--use_hard_sample', action='store_true', default=False, help='是否启用 hard sample 发现与重加权')
+    parser.add_argument('--use_hard_sample', action='store_true', default=False, help='是否启用 hard sample 发现与重加权（MMOE/AdaFTR）')
     parser.add_argument('--hard_sample_ratio', type=float, default=0.2, help='每个 batch 挖掘 hard sample 的比例')
     parser.add_argument('--hard_sample_weight', type=float, default=2.0, help='hard sample 的损失权重放大倍数')
     parser.add_argument('--hard_sample_warmup_epochs', type=int, default=1, help='启用 hard sample 之前的 warmup epoch 数')
@@ -175,6 +175,18 @@ def build_model(args):
             tau_max               = args.tau_max,
             relatedness_hidden_dim= args.relatedness_hidden_dim,
             lambda_rel            = args.lambda_rel,
+            use_hard_sample       = args.use_hard_sample,
+            hard_sample_ratio     = args.hard_sample_ratio,
+            hard_sample_weight    = args.hard_sample_weight,
+            hard_sample_warmup_epochs = args.hard_sample_warmup_epochs,
+        )
+
+    # MMOE + hard sample 专用参数
+    if args.model == 'mmoe':
+        return model_cls(
+            **common,
+            num_experts        = args.num_experts,
+            expert_hidden_dims = args.expert_hidden_dims,
             use_hard_sample       = args.use_hard_sample,
             hard_sample_ratio     = args.hard_sample_ratio,
             hard_sample_weight    = args.hard_sample_weight,

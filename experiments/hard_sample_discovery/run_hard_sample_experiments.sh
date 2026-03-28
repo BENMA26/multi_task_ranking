@@ -14,13 +14,12 @@ set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR"
-mkdir -p logs
 
 TRAIN_PY=/work/home/maben/project/rec_sys/projects/multi_task_ranking/train_rank.py
 OUTPUT_ROOT=/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/hard_sample_discovery/outputs
 
 COMMON_ARGS="
-    --model adaftr
+    --model mmoe
     --batch_size 1024
     --num_workers 32
     --max_epochs 20
@@ -29,12 +28,7 @@ COMMON_ARGS="
     --embedding_dim 32
     --expert_hidden_dims 256 128
     --num_experts 6
-    --adaftr_tower_hidden_dims 256 128 64
-    --alpha_contrastive 0.01
-    --tau_min 0.08
-    --tau_max 0.50
-    --relatedness_hidden_dim 64
-    --lambda_rel 0.1
+    --tower_hidden_dims 64
     --accelerator gpu
     --devices 4
     --esmm
@@ -60,11 +54,11 @@ run_exp() {
     echo ""
 }
 
-# 1) AdaFTR baseline（无 hard sample）
-run_exp "adaftr_baseline_bestparam" ""
+# 1) MMOE baseline（无 hard sample）
+run_exp "mmoe_esmm_baseline" ""
 
 # 2) Hard sample: 低比例、温和权重
-run_exp "adaftr_hard_ratio10_w15" "
+run_exp "mmoe_esmm_hard_ratio10_w15" "
     --use_hard_sample
     --hard_sample_ratio 0.10
     --hard_sample_weight 1.5
@@ -72,7 +66,7 @@ run_exp "adaftr_hard_ratio10_w15" "
 "
 
 # 3) Hard sample: 中等比例、标准权重
-run_exp "adaftr_hard_ratio20_w20" "
+run_exp "mmoe_esmm_hard_ratio20_w20" "
     --use_hard_sample
     --hard_sample_ratio 0.20
     --hard_sample_weight 2.0
@@ -80,7 +74,7 @@ run_exp "adaftr_hard_ratio20_w20" "
 "
 
 # 4) Hard sample: 高比例、更强权重
-run_exp "adaftr_hard_ratio30_w25" "
+run_exp "mmoe_esmm_hard_ratio30_w25" "
     --use_hard_sample
     --hard_sample_ratio 0.30
     --hard_sample_weight 2.5

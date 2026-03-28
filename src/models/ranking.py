@@ -1045,10 +1045,18 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         dcn_num_layers      : int       = 2,
         dcn_dropout         : float     = 0.0,
         dcn_rank            : int       = 0,
+        use_hard_sample     : bool      = False,
+        hard_sample_ratio   : float     = 0.2,
+        hard_sample_weight  : float     = 2.0,
+        hard_sample_warmup_epochs: int  = 1,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
         self.learning_rate = learning_rate
+        self.use_hard_sample = use_hard_sample
+        self.hard_sample_ratio = hard_sample_ratio
+        self.hard_sample_weight = hard_sample_weight
+        self.hard_sample_warmup_epochs = hard_sample_warmup_epochs
 
         input_dim = self._build_feature_layers(
             sparse_feature_names, sparse_feature_dims, dense_feature_names, embedding_dim,
@@ -1121,6 +1129,80 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
             cvr_out = torch.sum(expert_outputs * cvr_weights, dim=1)
 
             return self.ctr_tower(ctr_out), self.cvr_tower(cvr_out)
+
+    def _build_hard_sample_weights(self, difficulty: torch.Tensor):
+        """
+        基于 batch 内难度分数（越大越难）做 top-ratio 样本挖掘并返回权重。
+        """
+        n = difficulty.numel()
+        if (
+            (not self.use_hard_sample)
+            or (self.current_epoch < self.hard_sample_warmup_epochs)
+            or n == 0
+        ):
+            return torch.ones_like(difficulty), 0.0
+
+        ratio = float(min(max(self.hard_sample_ratio, 0.0), 1.0))
+        if ratio <= 0.0:
+            return torch.ones_like(difficulty), 0.0
+
+        k = max(1, int(n * ratio))
+        k = min(k, n)
+        top_idx = torch.topk(difficulty, k=k, largest=True).indices
+
+        weights = torch.ones_like(difficulty)
+        hard_w = max(float(self.hard_sample_weight), 1.0)
+        weights[top_idx] = hard_w
+        return weights, float(k) / float(n)
+
+    def _compute_losses(self, batch):
+        inputs, labels = batch
+        ctr_labels = labels["click"]
+        cvr_labels = labels["purchase"]
+
+        if self.use_entropy_reg:
+            ctr_logits, cvr_logits, gate_entropy = self(inputs, return_gate_entropy=True)
+        else:
+            ctr_logits, cvr_logits = self(inputs)
+            gate_entropy = None
+
+        pCTR = torch.sigmoid(ctr_logits)
+        if self.sigmoid == 1:
+            pCVR = torch.sigmoid(cvr_logits)
+        else:
+            pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
+
+        # 逐样本 loss，便于 hard sample 挖掘和重加权
+        ctr_loss_vec = nn.functional.binary_cross_entropy_with_logits(
+            ctr_logits, ctr_labels.float(), reduction="none"
+        )
+
+        if self.esmm:
+            pCTCVR = pCTR * pCVR
+            cvr_loss_vec = nn.functional.binary_cross_entropy(
+                pCTCVR, cvr_labels.float(), reduction="none"
+            )
+        else:
+            cvr_loss_vec = nn.functional.binary_cross_entropy_with_logits(
+                cvr_logits, cvr_labels.float(), reduction="none"
+            )
+
+        difficulty = (self.ctr_weight * ctr_loss_vec + self.cvr_weight * cvr_loss_vec).detach()
+        hard_weights, hard_ratio = self._build_hard_sample_weights(difficulty)
+        denom = hard_weights.sum().clamp_min(1.0)
+
+        ctr_loss = (ctr_loss_vec * hard_weights).sum() / denom
+        cvr_loss = (cvr_loss_vec * hard_weights).sum() / denom
+
+        if self.use_entropy_reg and gate_entropy is not None:
+            entropy_loss = -gate_entropy.mean()
+        else:
+            entropy_loss = torch.tensor(0.0, device=ctr_logits.device)
+
+        if self.training and self.use_hard_sample and (self._trainer is not None):
+            self.log("train_hard_ratio", hard_ratio, on_step=False, on_epoch=True)
+
+        return ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss
 
 class PLEModel(_MultiTaskMixin, pl.LightningModule):
     """

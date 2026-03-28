@@ -12,16 +12,13 @@
 
 mkdir -p logs
 
-# 目标：在 DCN-v2 条件下复用 entropy_regularization 的实验矩阵
-# 模型固定 mmoe（有 gate），并开启 --use_dcn
-# 组合：
-#   1) baseline        : no entropy + no upgrad
-#   2) entropy_only    : entropy + no upgrad
-#   3) upgrad_only     : no entropy + upgrad
-#   4) entropy_upgrad  : entropy + upgrad
-
 TRAIN_PY=/work/home/maben/project/rec_sys/projects/multi_task_ranking/train_rank.py
 OUTPUT_ROOT=/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/dcn_v2_feature_cross/outputs
+
+# 可通过环境变量覆盖
+# 例：DCN_RANK=32 LAMBDA_ENTROPY=0.003 bash run_dcn_entropy_experiments.sh
+DCN_RANK=${DCN_RANK:-64}
+LAMBDA_ENTROPY=${LAMBDA_ENTROPY:-0.003}
 
 USE_ENTROPY_REGS=("false" "true" "false" "true")
 USE_TORCHJ_DS=("false" "false" "true" "true")
@@ -35,26 +32,26 @@ for i in "${!USE_ENTROPY_REGS[@]}"; do
     USE_TORCHJD=${USE_TORCHJ_DS[$i]}
 
     if [ "$USE_ENTROPY" == "true" ] && [ "$USE_TORCHJD" == "true" ]; then
-        EXP_NAME="mmoe_esmm_dcnv2_entropy_upgrad"
-        ENTROPY_FLAGS="--use_entropy_reg --lambda_entropy 0.01"
+        EXP_NAME="mmoe_esmm_dcnv2_rank${DCN_RANK}_entropy_upgrad"
+        ENTROPY_FLAGS="--use_entropy_reg --lambda_entropy ${LAMBDA_ENTROPY}"
         TORCHJD_FLAGS="--use_torchjd --aggregation_method upgrad"
     elif [ "$USE_ENTROPY" == "true" ]; then
-        EXP_NAME="mmoe_esmm_dcnv2_entropy_only"
-        ENTROPY_FLAGS="--use_entropy_reg --lambda_entropy 0.01"
+        EXP_NAME="mmoe_esmm_dcnv2_rank${DCN_RANK}_entropy_only"
+        ENTROPY_FLAGS="--use_entropy_reg --lambda_entropy ${LAMBDA_ENTROPY}"
         TORCHJD_FLAGS=""
     elif [ "$USE_TORCHJD" == "true" ]; then
-        EXP_NAME="mmoe_esmm_dcnv2_upgrad_only"
+        EXP_NAME="mmoe_esmm_dcnv2_rank${DCN_RANK}_upgrad_only"
         ENTROPY_FLAGS=""
         TORCHJD_FLAGS="--use_torchjd --aggregation_method upgrad"
     else
-        EXP_NAME="mmoe_esmm_dcnv2_baseline"
+        EXP_NAME="mmoe_esmm_dcnv2_rank${DCN_RANK}_baseline"
         ENTROPY_FLAGS=""
         TORCHJD_FLAGS=""
     fi
 
     echo "=========================================="
     echo "Experiment [${CURRENT}/${TOTAL}]: ${EXP_NAME}"
-    echo "Model: mmoe + dcnv2 | Entropy: ${USE_ENTROPY} | UPGrad: ${USE_TORCHJD}"
+    echo "Model: mmoe + dcnv2(rank=${DCN_RANK}) | Entropy: ${USE_ENTROPY} | UPGrad: ${USE_TORCHJD}"
     echo "=========================================="
 
     python -u ${TRAIN_PY} \
@@ -62,8 +59,8 @@ for i in "${!USE_ENTROPY_REGS[@]}"; do
         --batch_size 1024 \
         --num_workers 32 \
         --max_epochs 20 \
-        --learning_rate 1e-3 \
-        --dropout 0.2 \
+        --learning_rate 7e-4 \
+        --dropout 0.25 \
         --embedding_dim 32 \
         --expert_hidden_dims 256 128 \
         --num_experts 6 \
@@ -74,7 +71,7 @@ for i in "${!USE_ENTROPY_REGS[@]}"; do
         --sigmoid 1 \
         --strategy ddp_find_unused_parameters_false \
         --early_stop_patience 3 \
-        --use_dcn --dcn_num_layers 2 --dcn_dropout 0.0 \
+        --use_dcn --dcn_num_layers 2 --dcn_dropout 0.10 --dcn_rank ${DCN_RANK} \
         ${ENTROPY_FLAGS} \
         ${TORCHJD_FLAGS} \
         --exp_dir ${OUTPUT_ROOT}/${EXP_NAME}

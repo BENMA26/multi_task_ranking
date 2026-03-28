@@ -70,6 +70,7 @@ def parse_args():
     parser.add_argument('--use_dcn', action='store_true', default=False, help='是否在特征编码后加 DCN-v2 交叉层（ShareBottom/MMOE 生效）')
     parser.add_argument('--dcn_num_layers', type=int, default=2, help='DCN-v2 交叉层数量')
     parser.add_argument('--dcn_dropout', type=float, default=0.0, help='DCN-v2 交叉层 Dropout')
+    parser.add_argument('--dcn_rank', type=int, default=0, help='DCN-v2 低秩分解维度，0 表示全秩')
 
     # ── ShareBottom 专用 ────────────────────────────────────────────────────
     parser.add_argument('--shared_hidden_dims', type=int, nargs='+', default=[256, 128], help='共享底层各隐层维度（仅 share_bottom 有效）')
@@ -131,6 +132,7 @@ def build_model(args):
         use_dcn              = args.use_dcn,
         dcn_num_layers       = args.dcn_num_layers,
         dcn_dropout          = args.dcn_dropout,
+        dcn_rank             = args.dcn_rank,
     )
 
     # ShareBottom 专用参数

@@ -36,39 +36,59 @@ def _create_aggregator(method: str):
 
 class DCNv2CrossLayer(nn.Module):
     """
-    DCN-v2 矩阵核交叉层（Cross Layer）
+    DCN-v2 交叉层（Cross Layer），支持全秩和低秩两种模式
 
     论文：DCN V2: Improved Deep & Cross Network and Practical Lessons for
           Web-scale Learning to Rank Systems (Wang et al., 2021)
 
-    与 DCN-v1 的标量 w 不同，DCN-v2 使用完整的 [d, d] 权重矩阵，
-    能捕获更丰富的 bit-wise 特征交叉：
-
-        x_{l+1} = x_0 ⊙ (W_l · x_l + b_l) + x_l
+    全秩：
+        x_{l+1} = x_0 ⊙ (W_l · x_l + b_l) + x_l      参数量 O(d^2)
+    低秩：
+        x_{l+1} = x_0 ⊙ (U_l(V_l · x_l) + b_l) + x_l 参数量 O(d * r)
 
     Args:
-        input_dim : 输入 / 输出维度（交叉层不改变维度）
+        input_dim : 输入/输出维度（交叉层不改变维度）
         num_layers: 交叉层数量
         dropout   : 每层后的 Dropout
+        rank      : 低秩分解维度，0 表示全秩
     """
 
-    def __init__(self, input_dim: int, num_layers: int = 2, dropout: float = 0.0):
+    def __init__(self, input_dim: int, num_layers: int = 2, dropout: float = 0.0, rank: int = 0):
         super().__init__()
         self.num_layers = num_layers
-        self.cross_weights = nn.ParameterList([
-            nn.Parameter(torch.empty(input_dim, input_dim))
-            for _ in range(num_layers)
-        ])
+        self.rank = rank
+
+        if rank > 0:
+            self.U = nn.ParameterList([
+                nn.Parameter(torch.empty(input_dim, rank))
+                for _ in range(num_layers)
+            ])
+            self.V = nn.ParameterList([
+                nn.Parameter(torch.empty(rank, input_dim))
+                for _ in range(num_layers)
+            ])
+            for u, v in zip(self.U, self.V):
+                nn.init.xavier_normal_(u)
+                nn.init.xavier_normal_(v)
+        else:
+            self.cross_weights = nn.ParameterList([
+                nn.Parameter(torch.empty(input_dim, input_dim))
+                for _ in range(num_layers)
+            ])
+            for w in self.cross_weights:
+                nn.init.xavier_normal_(w)
+
         self.cross_biases = nn.ParameterList([
             nn.Parameter(torch.zeros(input_dim))
+            for _ in range(num_layers)
+        ])
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(input_dim)
             for _ in range(num_layers)
         ])
         self.dropouts = nn.ModuleList([
             nn.Dropout(dropout) for _ in range(num_layers)
         ])
-        # 初始化权重（Xavier）
-        for w in self.cross_weights:
-            nn.init.xavier_normal_(w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -79,15 +99,24 @@ class DCNv2CrossLayer(nn.Module):
         """
         x0 = x
         xl = x
-        for w, b, drop in zip(self.cross_weights, self.cross_biases, self.dropouts):
-            # xl_next = x0 ⊙ (W · xl + b) + xl
-            xl = x0 * (xl @ w + b) + xl
-            xl = drop(xl)
+        for i in range(self.num_layers):
+            if self.rank > 0:
+                xl = x0 * (xl @ self.V[i].T @ self.U[i].T + self.cross_biases[i]) + xl
+            else:
+                xl = x0 * (xl @ self.cross_weights[i] + self.cross_biases[i]) + xl
+            xl = self.layer_norms[i](xl)
+            xl = self.dropouts[i](xl)
         return xl
 
 
 class Expert(nn.Module):
-    """专家网络：可选在 MLP 前加 DCN-v2 特征交叉层"""
+    """
+    专家网络：支持标准 MLP 或 DCN-v2 并行结构
+
+    并行结构（use_dcn=True）：
+        x -> CrossNet -> cross_out  \\
+        x -> MLP      -> mlp_out    +-> concat -> proj -> output
+    """
 
     def __init__(
         self,
@@ -95,18 +124,31 @@ class Expert(nn.Module):
         hidden_dims: List[int],
         dropout    : float = 0.2,
         use_dcn    : bool  = False,
-        dcn_num_layers: int   = 2,
-        dcn_dropout   : float = 0.0,
+        dcn_num_layers      : int       = 2,
+        dcn_dropout         : float     = 0.0,
+        dcn_rank      : int   = 0,
     ):
         super().__init__()
         self.use_dcn = use_dcn
+        self.mlp = self._build_mlp(input_dim, hidden_dims, dropout)
+
         if use_dcn:
-            self.dcn = DCNv2CrossLayer(input_dim, num_layers=dcn_num_layers, dropout=dcn_dropout)
-            mlp_input_dim = input_dim * 2
-        else:
-            mlp_input_dim = input_dim
+            self.dcn = DCNv2CrossLayer(
+                input_dim,
+                num_layers=dcn_num_layers,
+                dropout=dcn_dropout,
+                rank=dcn_rank,
+            )
+            self.proj = nn.Sequential(
+                nn.Linear(input_dim + hidden_dims[-1], hidden_dims[-1]),
+                nn.BatchNorm1d(hidden_dims[-1]),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+
+    def _build_mlp(self, input_dim: int, hidden_dims: List[int], dropout: float):
         layers = []
-        dims = [mlp_input_dim] + hidden_dims
+        dims = [input_dim] + hidden_dims
         for i in range(len(dims) - 1):
             layers += [
                 nn.Linear(dims[i], dims[i + 1]),
@@ -114,13 +156,15 @@ class Expert(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(dropout),
             ]
-        self.network = nn.Sequential(*layers)
+        return nn.Sequential(*layers)
 
     def forward(self, x):
         if self.use_dcn:
-            dcn_x = self.dcn(x)
-            x = torch.cat([x, dcn_x], dim=-1)
-        return self.network(x)
+            cross_out = self.dcn(x)
+            mlp_out = self.mlp(x)
+            combined = torch.cat([cross_out, mlp_out], dim=-1)
+            return self.proj(combined)
+        return self.mlp(x)
 
 class Gate(nn.Module):
     """
@@ -848,6 +892,7 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         use_dcn             : bool      = False,
         dcn_num_layers      : int       = 2,
         dcn_dropout         : float     = 0.0,
+        dcn_rank            : int       = 0,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -859,7 +904,7 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
 
         # 共享底层
         self.shared_bottom = Expert(input_dim, shared_hidden_dims, dropout,
-                                    use_dcn=use_dcn, dcn_num_layers=dcn_num_layers, dcn_dropout=dcn_dropout)
+                                    use_dcn=use_dcn, dcn_num_layers=dcn_num_layers, dcn_dropout=dcn_dropout, dcn_rank=dcn_rank)
 
         # 任务塔
         self.ctr_tower = Tower(shared_hidden_dims[-1], tower_hidden_dims, dropout)
@@ -998,6 +1043,7 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         use_dcn             : bool      = False,
         dcn_num_layers      : int       = 2,
         dcn_dropout         : float     = 0.0,
+        dcn_rank            : int       = 0,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -1007,16 +1053,29 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
             sparse_feature_names, sparse_feature_dims, dense_feature_names, embedding_dim,
         )
 
-        # 共享专家网络
+        # 特征交叉前置：x -> cross(x) -> concat([cross_x, x]) -> MMOE
+        self.use_dcn = use_dcn
+        if use_dcn:
+            self.feature_cross = DCNv2CrossLayer(
+                input_dim,
+                num_layers=dcn_num_layers,
+                dropout=dcn_dropout,
+                rank=dcn_rank,
+            )
+            mmoe_input_dim = input_dim * 2
+        else:
+            self.feature_cross = None
+            mmoe_input_dim = input_dim
+
+        # 共享专家网络（DCN 已前置，Expert 保持纯 MLP）
         self.experts = nn.ModuleList([
-            Expert(input_dim, expert_hidden_dims, dropout,
-                   use_dcn=use_dcn, dcn_num_layers=dcn_num_layers, dcn_dropout=dcn_dropout)
+            Expert(mmoe_input_dim, expert_hidden_dims, dropout, use_dcn=False)
             for _ in range(num_experts)
         ])
 
         # 每个任务独立门控（MMOE 核心）
-        self.ctr_gate = Gate(input_dim, num_experts)
-        self.cvr_gate = Gate(input_dim, num_experts)
+        self.ctr_gate = Gate(mmoe_input_dim, num_experts)
+        self.cvr_gate = Gate(mmoe_input_dim, num_experts)
 
         # 任务塔
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
@@ -1035,6 +1094,10 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
             cvr_logit: [B, 1]
             gate_entropy: [B] 平均 gate entropy（可选）
         """
+        if self.use_dcn:
+            cross_x = self.feature_cross(x)
+            x = torch.cat([cross_x, x], dim=-1)
+
         expert_outputs = torch.stack([e(x) for e in self.experts], dim=1)  # [B, E, d]
 
         if return_gate_entropy:

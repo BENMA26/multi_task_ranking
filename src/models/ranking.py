@@ -102,8 +102,11 @@ class Expert(nn.Module):
         self.use_dcn = use_dcn
         if use_dcn:
             self.dcn = DCNv2CrossLayer(input_dim, num_layers=dcn_num_layers, dropout=dcn_dropout)
+            mlp_input_dim = input_dim * 2
+        else:
+            mlp_input_dim = input_dim
         layers = []
-        dims = [input_dim] + hidden_dims
+        dims = [mlp_input_dim] + hidden_dims
         for i in range(len(dims) - 1):
             layers += [
                 nn.Linear(dims[i], dims[i + 1]),
@@ -115,7 +118,8 @@ class Expert(nn.Module):
 
     def forward(self, x):
         if self.use_dcn:
-            x = self.dcn(x)
+            dcn_x = self.dcn(x)
+            x = torch.cat([x, dcn_x], dim=-1)
         return self.network(x)
 
 class Gate(nn.Module):

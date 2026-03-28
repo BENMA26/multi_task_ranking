@@ -185,6 +185,8 @@ class _MultiTaskMixin:
         sigmoid           : int = 1,
         use_entropy_reg   : bool = False,
         lambda_entropy    : float = 0.01,
+        use_ema           : bool = False,
+        ema_decay         : float = 0.999,
     ):
         """
         初始化 TorchJD 梯度聚合和 Entropy 正则化参数
@@ -192,6 +194,8 @@ class _MultiTaskMixin:
         Args:
             use_entropy_reg: 是否使用 Entropy 正则化防止门控极化
             lambda_entropy: Entropy 正则化权重
+            use_ema: 是否启用 EMA 参数更新
+            ema_decay: EMA 衰减系数（越接近 1 越平滑）
         """
         self.use_torchjd = use_torchjd
         self.ctr_weight  = ctr_weight
@@ -200,6 +204,8 @@ class _MultiTaskMixin:
         self.sigmoid     = sigmoid
         self.use_entropy_reg = use_entropy_reg
         self.lambda_entropy  = lambda_entropy
+        self.use_ema    = use_ema
+        self.ema_decay  = ema_decay
         if use_torchjd:
             self.automatic_optimization = False
             self.aggregator = _create_aggregator(aggregation_method)
@@ -209,15 +215,57 @@ class _MultiTaskMixin:
         self.val_cvr_auc  = AUROC(task="binary")
         self.test_ctr_auc = AUROC(task="binary")
         self.test_cvr_auc = AUROC(task="binary")
+        # EMA 专用指标
+        self.val_ema_ctr_auc  = AUROC(task="binary")
+        self.val_ema_cvr_auc  = AUROC(task="binary")
+        self.test_ema_ctr_auc = AUROC(task="binary")
+        self.test_ema_cvr_auc = AUROC(task="binary")
+
+    # ------------------------------------------------------------------ #
+    # EMA                                                                 #
+    # ------------------------------------------------------------------ #
+
+    def on_fit_start(self):
+        """训练开始时初始化 EMA 参数副本"""
+        if self.use_ema:
+            self._ema_params = {
+                name: param.data.clone()
+                for name, param in self.named_parameters()
+            }
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """每个训练 batch 结束后更新 EMA 参数"""
+        if not self.use_ema:
+            return
+        decay = self.ema_decay
+        for name, param in self.named_parameters():
+            self._ema_params[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
+
+    def _forward_with_ema(self, inputs: Dict[str, torch.Tensor], return_gate_entropy: bool = False):
+        """用 EMA 参数做前向推理（临时替换参数，推理后还原）"""
+        original = {name: param.data for name, param in self.named_parameters()}
+        for name, param in self.named_parameters():
+            param.data = self._ema_params[name].to(param.device)
+        try:
+            result = self.forward(inputs, return_gate_entropy=return_gate_entropy)
+        finally:
+            for name, param in self.named_parameters():
+                param.data = original[name]
+        return result
 
     # ------------------------------------------------------------------ #
     # forward                                                             #
     # ------------------------------------------------------------------ #
 
-    def forward(self, inputs: Dict[str, torch.Tensor]):
+    def forward(self, inputs: Dict[str, torch.Tensor], return_gate_entropy: bool = False):
         x = self._encode_features(inputs)
-        ctr_logit, cvr_logit = self._forward_logits(x)
-        return ctr_logit.squeeze(-1), cvr_logit.squeeze(-1)
+        result = self._forward_logits(x, return_gate_entropy=return_gate_entropy)
+        if return_gate_entropy:
+            ctr_logit, cvr_logit, gate_entropy = result
+            return ctr_logit.squeeze(-1), cvr_logit.squeeze(-1), gate_entropy
+        else:
+            ctr_logit, cvr_logit = result
+            return ctr_logit.squeeze(-1), cvr_logit.squeeze(-1)
 
     # ------------------------------------------------------------------ #
     # training_step 分发                                                   #
@@ -426,6 +474,8 @@ class _MultiTaskMixin:
         sigmoid           : int = 1,
         use_entropy_reg   : bool = False,
         lambda_entropy    : float = 0.01,
+        use_ema           : bool = False,
+        ema_decay         : float = 0.999,
     ):
         """
         初始化 TorchJD 梯度聚合和 Entropy 正则化参数
@@ -433,6 +483,8 @@ class _MultiTaskMixin:
         Args:
             use_entropy_reg: 是否使用 Entropy 正则化防止门控极化
             lambda_entropy: Entropy 正则化权重
+            use_ema: 是否启用 EMA 参数更新
+            ema_decay: EMA 衰减系数（越接近 1 越平滑）
         """
         self.use_torchjd = use_torchjd
         self.ctr_weight  = ctr_weight
@@ -441,6 +493,8 @@ class _MultiTaskMixin:
         self.sigmoid     = sigmoid
         self.use_entropy_reg = use_entropy_reg
         self.lambda_entropy  = lambda_entropy
+        self.use_ema    = use_ema
+        self.ema_decay  = ema_decay
         if use_torchjd:
             self.automatic_optimization = False
             self.aggregator = _create_aggregator(aggregation_method)
@@ -450,15 +504,57 @@ class _MultiTaskMixin:
         self.val_cvr_auc  = AUROC(task="binary")
         self.test_ctr_auc = AUROC(task="binary")
         self.test_cvr_auc = AUROC(task="binary")
+        # EMA 专用指标
+        self.val_ema_ctr_auc  = AUROC(task="binary")
+        self.val_ema_cvr_auc  = AUROC(task="binary")
+        self.test_ema_ctr_auc = AUROC(task="binary")
+        self.test_ema_cvr_auc = AUROC(task="binary")
+
+    # ------------------------------------------------------------------ #
+    # EMA                                                                 #
+    # ------------------------------------------------------------------ #
+
+    def on_fit_start(self):
+        """训练开始时初始化 EMA 参数副本"""
+        if self.use_ema:
+            self._ema_params = {
+                name: param.data.clone()
+                for name, param in self.named_parameters()
+            }
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """每个训练 batch 结束后更新 EMA 参数"""
+        if not self.use_ema:
+            return
+        decay = self.ema_decay
+        for name, param in self.named_parameters():
+            self._ema_params[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
+
+    def _forward_with_ema(self, inputs: Dict[str, torch.Tensor], return_gate_entropy: bool = False):
+        """用 EMA 参数做前向推理（临时替换参数，推理后还原）"""
+        original = {name: param.data for name, param in self.named_parameters()}
+        for name, param in self.named_parameters():
+            param.data = self._ema_params[name].to(param.device)
+        try:
+            result = self.forward(inputs, return_gate_entropy=return_gate_entropy)
+        finally:
+            for name, param in self.named_parameters():
+                param.data = original[name]
+        return result
 
     # ------------------------------------------------------------------ #
     # forward                                                             #
     # ------------------------------------------------------------------ #
 
-    def forward(self, inputs: Dict[str, torch.Tensor]):
+    def forward(self, inputs: Dict[str, torch.Tensor], return_gate_entropy: bool = False):
         x = self._encode_features(inputs)
-        ctr_logit, cvr_logit = self._forward_logits(x)
-        return ctr_logit.squeeze(-1), cvr_logit.squeeze(-1)
+        result = self._forward_logits(x, return_gate_entropy=return_gate_entropy)
+        if return_gate_entropy:
+            ctr_logit, cvr_logit, gate_entropy = result
+            return ctr_logit.squeeze(-1), cvr_logit.squeeze(-1), gate_entropy
+        else:
+            ctr_logit, cvr_logit = result
+            return ctr_logit.squeeze(-1), cvr_logit.squeeze(-1)
 
     # ------------------------------------------------------------------ #
     # training_step 分发                                                   #
@@ -540,21 +636,31 @@ class _MultiTaskMixin:
     # validation / test                                                   #
     # ------------------------------------------------------------------ #
 
+    def _update_auc_metrics(self, ctr_logits, cvr_logits, ctr_labels, cvr_labels,
+                            ctr_metric, cvr_metric):
+        """更新 AUC 指标（原模型或 EMA 模型通用）"""
+        ctr_metric.update(torch.sigmoid(ctr_logits), ctr_labels.long())
+        click_mask = ctr_labels.bool()
+        if click_mask.any():
+            cvr_metric.update(
+                torch.sigmoid(cvr_logits[click_mask]),
+                cvr_labels[click_mask].long()
+            )
+
     def validation_step(self, batch, batch_idx):
         ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = \
             self._compute_losses(batch)
         loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss + self.lambda_entropy * entropy_loss
 
-        # CTR AUC：全量曝光样本
-        self.val_ctr_auc.update(torch.sigmoid(ctr_logits), ctr_labels.long())
+        self._update_auc_metrics(ctr_logits, cvr_logits, ctr_labels, cvr_labels,
+                                 self.val_ctr_auc, self.val_cvr_auc)
 
-        # CVR AUC：仅点击样本（pCVR = P(purchase | click)，未点击无真实标签）
-        click_mask = ctr_labels.bool()
-        if click_mask.any():
-            self.val_cvr_auc.update(
-                torch.sigmoid(cvr_logits[click_mask]),
-                cvr_labels[click_mask].long()
-            )
+        # EMA 评估
+        if self.use_ema and hasattr(self, '_ema_params'):
+            inputs, _ = batch
+            ema_ctr_logits, ema_cvr_logits = self._forward_with_ema(inputs)
+            self._update_auc_metrics(ema_ctr_logits, ema_cvr_logits, ctr_labels, cvr_labels,
+                                     self.val_ema_ctr_auc, self.val_ema_cvr_auc)
 
         self.log("val_loss",         loss,         prog_bar=True, sync_dist=True)
         self.log("val_ctr_loss",     ctr_loss,     sync_dist=True)
@@ -571,21 +677,29 @@ class _MultiTaskMixin:
         self.val_ctr_auc.reset()
         self.val_cvr_auc.reset()
 
+        if self.use_ema:
+            ema_ctr_auc = self.val_ema_ctr_auc.compute()
+            ema_cvr_auc = self.val_ema_cvr_auc.compute()
+            self.log("val_ema_ctr_auc",      ema_ctr_auc,                 prog_bar=True, sync_dist=True)
+            self.log("val_ema_cvr_auc",      ema_cvr_auc,                 prog_bar=True, sync_dist=True)
+            self.log("val_ema_combined_auc", ema_ctr_auc * ema_cvr_auc,   prog_bar=True, sync_dist=True)
+            self.val_ema_ctr_auc.reset()
+            self.val_ema_cvr_auc.reset()
+
     def test_step(self, batch, batch_idx):
         ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = \
             self._compute_losses(batch)
         loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss + self.lambda_entropy * entropy_loss
 
-        # CTR AUC：全量曝光样本
-        self.test_ctr_auc.update(torch.sigmoid(ctr_logits), ctr_labels.long())
+        self._update_auc_metrics(ctr_logits, cvr_logits, ctr_labels, cvr_labels,
+                                 self.test_ctr_auc, self.test_cvr_auc)
 
-        # CVR AUC：仅点击样本（pCVR = P(purchase | click)，未点击无真实标签）
-        click_mask = ctr_labels.bool()
-        if click_mask.any():
-            self.test_cvr_auc.update(
-                torch.sigmoid(cvr_logits[click_mask]),
-                cvr_labels[click_mask].long()
-            )
+        # EMA 评估
+        if self.use_ema and hasattr(self, '_ema_params'):
+            inputs, _ = batch
+            ema_ctr_logits, ema_cvr_logits = self._forward_with_ema(inputs)
+            self._update_auc_metrics(ema_ctr_logits, ema_cvr_logits, ctr_labels, cvr_labels,
+                                     self.test_ema_ctr_auc, self.test_ema_cvr_auc)
 
         self.log("test_loss",         loss,         sync_dist=True)
         self.log("test_ctr_loss",     ctr_loss,     sync_dist=True)
@@ -601,6 +715,15 @@ class _MultiTaskMixin:
         self.log("test_combined_auc", test_ctr_auc * test_cvr_auc, prog_bar=True, sync_dist=True)
         self.test_ctr_auc.reset()
         self.test_cvr_auc.reset()
+
+        if self.use_ema:
+            ema_ctr_auc = self.test_ema_ctr_auc.compute()
+            ema_cvr_auc = self.test_ema_cvr_auc.compute()
+            self.log("test_ema_ctr_auc",      ema_ctr_auc,                prog_bar=True, sync_dist=True)
+            self.log("test_ema_cvr_auc",      ema_cvr_auc,                prog_bar=True, sync_dist=True)
+            self.log("test_ema_combined_auc", ema_ctr_auc * ema_cvr_auc,  prog_bar=True, sync_dist=True)
+            self.test_ema_ctr_auc.reset()
+            self.test_ema_cvr_auc.reset()
 
     # ------------------------------------------------------------------ #
     # optimizer                                                           #
@@ -651,6 +774,8 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         aggregation_method  : str       = "upgrad",
         esmm                : bool      = False,
         sigmoid             : int       = 1,
+        use_ema             : bool      = False,
+        ema_decay           : float     = 0.999,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -667,7 +792,7 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(shared_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(shared_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_ema=use_ema, ema_decay=ema_decay)
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor):
@@ -711,6 +836,8 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
         sigmoid             : int       = 1,
         use_entropy_reg     : bool      = False,
         lambda_entropy      : float     = 0.01,
+        use_ema             : bool      = False,
+        ema_decay           : float     = 0.999,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -731,7 +858,7 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_entropy_reg, lambda_entropy)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_entropy_reg, lambda_entropy, use_ema=use_ema, ema_decay=ema_decay)
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
@@ -793,6 +920,8 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         sigmoid             : int       = 1,
         use_entropy_reg     : bool      = False,
         lambda_entropy      : float     = 0.01,
+        use_ema             : bool      = False,
+        ema_decay           : float     = 0.999,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -816,7 +945,7 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_entropy_reg, lambda_entropy)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_entropy_reg, lambda_entropy, use_ema=use_ema, ema_decay=ema_decay)
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
@@ -909,7 +1038,9 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
         use_torchjd          : bool      = False,
         aggregation_method   : str       = "upgrad",
         esmm                 : bool      = False,
-        sigmoid             : int       = 1,
+        sigmoid              : int       = 1,
+        use_ema              : bool      = False,
+        ema_decay            : float     = 0.999,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -962,7 +1093,7 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid)
+        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_ema=use_ema, ema_decay=ema_decay)
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor):

@@ -66,6 +66,11 @@ def parse_args():
     parser.add_argument('--use_ema', action='store_true', default=False, help='是否启用 EMA 参数更新')
     parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA 衰减系数')
 
+    # ── DCN-v2 特征交叉 ─────────────────────────────────────────────────────
+    parser.add_argument('--use_dcn', action='store_true', default=False, help='是否在特征编码后加 DCN-v2 交叉层（ShareBottom/MMOE 生效）')
+    parser.add_argument('--dcn_num_layers', type=int, default=2, help='DCN-v2 交叉层数量')
+    parser.add_argument('--dcn_dropout', type=float, default=0.0, help='DCN-v2 交叉层 Dropout')
+
     # ── ShareBottom 专用 ────────────────────────────────────────────────────
     parser.add_argument('--shared_hidden_dims', type=int, nargs='+', default=[256, 128], help='共享底层各隐层维度（仅 share_bottom 有效）')
 
@@ -123,6 +128,9 @@ def build_model(args):
         lambda_entropy       = args.lambda_entropy,
         use_ema              = args.use_ema,
         ema_decay            = args.ema_decay,
+        use_dcn              = args.use_dcn,
+        dcn_num_layers       = args.dcn_num_layers,
+        dcn_dropout          = args.dcn_dropout,
     )
 
     # ShareBottom 专用参数

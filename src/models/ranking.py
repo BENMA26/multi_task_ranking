@@ -34,6 +34,58 @@ def _create_aggregator(method: str):
     else:
         raise ValueError(f"未知的聚合方法: '{method}'，可选: upgrad / mgda / pcgrad / graddrop")
 
+class DCNv2CrossLayer(nn.Module):
+    """
+    DCN-v2 矩阵核交叉层（Cross Layer）
+
+    论文：DCN V2: Improved Deep & Cross Network and Practical Lessons for
+          Web-scale Learning to Rank Systems (Wang et al., 2021)
+
+    与 DCN-v1 的标量 w 不同，DCN-v2 使用完整的 [d, d] 权重矩阵，
+    能捕获更丰富的 bit-wise 特征交叉：
+
+        x_{l+1} = x_0 ⊙ (W_l · x_l + b_l) + x_l
+
+    Args:
+        input_dim : 输入 / 输出维度（交叉层不改变维度）
+        num_layers: 交叉层数量
+        dropout   : 每层后的 Dropout
+    """
+
+    def __init__(self, input_dim: int, num_layers: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.num_layers = num_layers
+        self.cross_weights = nn.ParameterList([
+            nn.Parameter(torch.empty(input_dim, input_dim))
+            for _ in range(num_layers)
+        ])
+        self.cross_biases = nn.ParameterList([
+            nn.Parameter(torch.zeros(input_dim))
+            for _ in range(num_layers)
+        ])
+        self.dropouts = nn.ModuleList([
+            nn.Dropout(dropout) for _ in range(num_layers)
+        ])
+        # 初始化权重（Xavier）
+        for w in self.cross_weights:
+            nn.init.xavier_normal_(w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, input_dim]
+        Returns:
+            out: [B, input_dim]  — 与输入同维度
+        """
+        x0 = x
+        xl = x
+        for w, b, drop in zip(self.cross_weights, self.cross_biases, self.dropouts):
+            # xl_next = x0 ⊙ (W · xl + b) + xl
+            xl = x0 * (xl @ w + b) + xl
+            xl = drop(xl)
+        return xl
+
+
 class Expert(nn.Module):
     """专家网络"""
 
@@ -138,9 +190,12 @@ class _MultiTaskMixin:
         sparse_feature_dims : Dict[str, int],
         dense_feature_names : List[str],
         embedding_dim       : int,
+        use_dcn             : bool = False,
+        dcn_num_layers      : int  = 2,
+        dcn_dropout         : float = 0.0,
     ) -> int:
         """
-        注册 Embedding 层并返回拼接后的 input_dim。
+        注册 Embedding 层，可选注册 DCN-v2 交叉层，并返回最终 input_dim。
         必须在 __init__ 中、网络构建之前调用。
         """
         self.sparse_feature_names = sparse_feature_names
@@ -151,11 +206,17 @@ class _MultiTaskMixin:
             for feat in sparse_feature_names
         })
 
-        input_dim = len(sparse_feature_names) * embedding_dim + len(dense_feature_names)
-        return input_dim
+        raw_dim = len(sparse_feature_names) * embedding_dim + len(dense_feature_names)
+
+        # 可选 DCN-v2 交叉层（接在特征拼接之后）
+        self.use_dcn = use_dcn
+        if use_dcn:
+            self.dcn = DCNv2CrossLayer(raw_dim, num_layers=dcn_num_layers, dropout=dcn_dropout)
+
+        return raw_dim
 
     def _encode_features(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """将原始 inputs 编码为单一张量 [B, input_dim]"""
+        """将原始 inputs 编码为单一张量 [B, input_dim]，若启用 DCN-v2 则先过交叉层"""
         parts = []
 
         # 稀疏特征 → Embedding
@@ -169,7 +230,13 @@ class _MultiTaskMixin:
                 t = t.unsqueeze(-1)
             parts.append(t)
 
-        return torch.cat(parts, dim=-1)  # [B, input_dim]
+        x = torch.cat(parts, dim=-1)  # [B, raw_dim]
+
+        # DCN-v2 特征交叉
+        if self.use_dcn:
+            x = self.dcn(x)  # [B, raw_dim]，维度不变
+
+        return x
 
     # ------------------------------------------------------------------ #
     # TorchJD & 指标初始化                                                  #
@@ -427,9 +494,12 @@ class _MultiTaskMixin:
         sparse_feature_dims : Dict[str, int],
         dense_feature_names : List[str],
         embedding_dim       : int,
+        use_dcn             : bool = False,
+        dcn_num_layers      : int  = 2,
+        dcn_dropout         : float = 0.0,
     ) -> int:
         """
-        注册 Embedding 层并返回拼接后的 input_dim。
+        注册 Embedding 层，可选注册 DCN-v2 交叉层，并返回最终 input_dim。
         必须在 __init__ 中、网络构建之前调用。
         """
         self.sparse_feature_names = sparse_feature_names
@@ -440,11 +510,17 @@ class _MultiTaskMixin:
             for feat in sparse_feature_names
         })
 
-        input_dim = len(sparse_feature_names) * embedding_dim + len(dense_feature_names)
-        return input_dim
+        raw_dim = len(sparse_feature_names) * embedding_dim + len(dense_feature_names)
+
+        # 可选 DCN-v2 交叉层（接在特征拼接之后）
+        self.use_dcn = use_dcn
+        if use_dcn:
+            self.dcn = DCNv2CrossLayer(raw_dim, num_layers=dcn_num_layers, dropout=dcn_dropout)
+
+        return raw_dim
 
     def _encode_features(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """将原始 inputs 编码为单一张量 [B, input_dim]"""
+        """将原始 inputs 编码为单一张量 [B, input_dim]，若启用 DCN-v2 则先过交叉层"""
         parts = []
 
         # 稀疏特征 → Embedding
@@ -458,7 +534,13 @@ class _MultiTaskMixin:
                 t = t.unsqueeze(-1)
             parts.append(t)
 
-        return torch.cat(parts, dim=-1)  # [B, input_dim]
+        x = torch.cat(parts, dim=-1)  # [B, raw_dim]
+
+        # DCN-v2 特征交叉
+        if self.use_dcn:
+            x = self.dcn(x)  # [B, raw_dim]，维度不变
+
+        return x
 
     # ------------------------------------------------------------------ #
     # TorchJD & 指标初始化                                                  #
@@ -776,13 +858,17 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         sigmoid             : int       = 1,
         use_ema             : bool      = False,
         ema_decay           : float     = 0.999,
+        use_dcn             : bool      = False,
+        dcn_num_layers      : int       = 2,
+        dcn_dropout         : float     = 0.0,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
         self.learning_rate = learning_rate
 
         input_dim = self._build_feature_layers(
-            sparse_feature_names, sparse_feature_dims, dense_feature_names, embedding_dim
+            sparse_feature_names, sparse_feature_dims, dense_feature_names, embedding_dim,
+            use_dcn=use_dcn, dcn_num_layers=dcn_num_layers, dcn_dropout=dcn_dropout,
         )
 
         # 共享底层
@@ -795,7 +881,7 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_ema=use_ema, ema_decay=ema_decay)
         self._init_metrics()
 
-    def _forward_logits(self, x: torch.Tensor):
+    def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
         shared_out = self.shared_bottom(x)
         return self.ctr_tower(shared_out), self.cvr_tower(shared_out)
 
@@ -922,13 +1008,17 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         lambda_entropy      : float     = 0.01,
         use_ema             : bool      = False,
         ema_decay           : float     = 0.999,
+        use_dcn             : bool      = False,
+        dcn_num_layers      : int       = 2,
+        dcn_dropout         : float     = 0.0,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
         self.learning_rate = learning_rate
 
         input_dim = self._build_feature_layers(
-            sparse_feature_names, sparse_feature_dims, dense_feature_names, embedding_dim
+            sparse_feature_names, sparse_feature_dims, dense_feature_names, embedding_dim,
+            use_dcn=use_dcn, dcn_num_layers=dcn_num_layers, dcn_dropout=dcn_dropout,
         )
 
         # 共享专家网络
@@ -1096,7 +1186,7 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
         self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_ema=use_ema, ema_decay=ema_decay)
         self._init_metrics()
 
-    def _forward_logits(self, x: torch.Tensor):
+    def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
         # 各路径的当前输入（第 0 层统一为原始编码 x）
         ctr_in    = x
         cvr_in    = x

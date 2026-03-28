@@ -1315,6 +1315,10 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         tau_max             : float     = 0.50,
         relatedness_hidden_dim: int     = 64,
         lambda_rel          : float     = 0.1,
+        use_hard_sample     : bool      = False,
+        hard_sample_ratio   : float     = 0.2,
+        hard_sample_weight  : float     = 2.0,
+        hard_sample_warmup_epochs: int  = 1,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -1372,6 +1376,10 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         self.tau_min = tau_min
         self.tau_max = tau_max
         self.lambda_rel = lambda_rel
+        self.use_hard_sample = use_hard_sample
+        self.hard_sample_ratio = hard_sample_ratio
+        self.hard_sample_weight = hard_sample_weight
+        self.hard_sample_warmup_epochs = hard_sample_warmup_epochs
 
         # 与其它模型保持一致的训练基础能力（TorchJD / EMA / metrics）
         self._init_torchjd(
@@ -1445,7 +1453,50 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         labels = torch.arange(sim.size(0), device=sim.device)
         return F.cross_entropy(sim, labels)
 
-    def _compute_losses(self, batch):
+    def _discover_hard_mask(self, score: torch.Tensor, valid_mask: torch.Tensor):
+        """
+        在有效样本上按 score 做 top-ratio 挖掘，返回 hard mask 与实际 hard ratio。
+        """
+        hard_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+        valid_idx = torch.where(valid_mask)[0]
+        valid_n = int(valid_idx.numel())
+        if valid_n == 0:
+            return hard_mask, 0.0
+
+        ratio = min(max(self.hard_sample_ratio, 0.0), 1.0)
+        if ratio <= 0.0:
+            return hard_mask, 0.0
+
+        k = max(1, int(valid_n * ratio))
+        k = min(k, valid_n)
+
+        valid_score = score[valid_idx]
+        top_idx = torch.topk(valid_score, k=k, largest=True).indices
+        hard_idx = valid_idx[top_idx]
+        hard_mask[hard_idx] = True
+        return hard_mask, float(k) / float(valid_n)
+
+    def _reduce_with_hard_weights(
+        self,
+        loss_vec: torch.Tensor,
+        valid_mask: torch.Tensor,
+        hard_mask: torch.Tensor,
+        for_training: bool,
+    ):
+        weights = torch.ones_like(loss_vec)
+        if (
+            for_training
+            and self.use_hard_sample
+            and self.current_epoch >= self.hard_sample_warmup_epochs
+        ):
+            hard_w = torch.full_like(weights, self.hard_sample_weight)
+            weights = torch.where(hard_mask, hard_w, weights)
+
+        weights = weights * valid_mask.float()
+        denom = weights.sum().clamp_min(1.0)
+        return (loss_vec * weights).sum() / denom
+
+    def _compute_losses(self, batch, for_training: bool = False):
         inputs, labels = batch
         ctr_labels = labels["click"].float()
         cvr_labels = labels["purchase"].float()
@@ -1459,19 +1510,37 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         else:
             pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
 
-        ctr_loss = nn.functional.binary_cross_entropy_with_logits(ctr_logits, ctr_labels)
+        # --- CTR loss（逐样本） ---
+        ctr_loss_vec = nn.functional.binary_cross_entropy_with_logits(
+            ctr_logits, ctr_labels, reduction="none"
+        )
+        ctr_valid_mask = torch.ones_like(ctr_labels, dtype=torch.bool)
+        ctr_hard_mask, hard_ctr_ratio = self._discover_hard_mask(
+            ctr_loss_vec.detach(), ctr_valid_mask
+        )
+        ctr_loss = self._reduce_with_hard_weights(
+            ctr_loss_vec, ctr_valid_mask, ctr_hard_mask, for_training
+        )
 
+        # --- CVR loss（逐样本） ---
         if self.esmm:
             pCTCVR = pCTR * pCVR
-            cvr_loss = nn.functional.binary_cross_entropy(pCTCVR, cvr_labels)
+            cvr_loss_vec = nn.functional.binary_cross_entropy(
+                pCTCVR, cvr_labels, reduction="none"
+            )
+            cvr_valid_mask = torch.ones_like(cvr_labels, dtype=torch.bool)
         else:
-            click_mask = ctr_labels > 0.5
-            if click_mask.any():
-                cvr_loss = nn.functional.binary_cross_entropy_with_logits(
-                    cvr_logits[click_mask], cvr_labels[click_mask]
-                )
-            else:
-                cvr_loss = torch.tensor(0.0, device=ctr_logits.device)
+            cvr_loss_vec = nn.functional.binary_cross_entropy_with_logits(
+                cvr_logits, cvr_labels, reduction="none"
+            )
+            cvr_valid_mask = ctr_labels > 0.5
+
+        cvr_hard_mask, hard_cvr_ratio = self._discover_hard_mask(
+            cvr_loss_vec.detach(), cvr_valid_mask
+        )
+        cvr_loss = self._reduce_with_hard_weights(
+            cvr_loss_vec, cvr_valid_mask, cvr_hard_mask, for_training
+        )
 
         contrastive_loss = self._contrastive_loss(h_ctr, h_cvr, temperature)
 
@@ -1488,6 +1557,8 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
             cvr_loss,
             contrastive_loss,
             rel_loss,
+            hard_ctr_ratio,
+            hard_cvr_ratio,
         )
 
     def _training_step_standard(self, batch):
@@ -1500,7 +1571,9 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
             cvr_loss,
             contrastive_loss,
             rel_loss,
-        ) = self._compute_losses(batch)
+            hard_ctr_ratio,
+            hard_cvr_ratio,
+        ) = self._compute_losses(batch, for_training=True)
 
         loss = (
             self.ctr_weight * ctr_loss
@@ -1513,6 +1586,8 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         self.log("train_cvr_loss", cvr_loss)
         self.log("train_contrastive_loss", contrastive_loss)
         self.log("train_relatedness_loss", rel_loss)
+        self.log("train_hard_ctr_ratio", hard_ctr_ratio)
+        self.log("train_hard_cvr_ratio", hard_cvr_ratio)
         return loss
 
     def _training_step_torchjd(self, batch):
@@ -1528,7 +1603,9 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
             cvr_loss,
             contrastive_loss,
             rel_loss,
-        ) = self._compute_losses(batch)
+            hard_ctr_ratio,
+            hard_cvr_ratio,
+        ) = self._compute_losses(batch, for_training=True)
 
         backward([ctr_loss, cvr_loss], aggregator=self.aggregator)
         aux_loss = self.alpha_contrastive * contrastive_loss + self.lambda_rel * rel_loss
@@ -1541,6 +1618,8 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         self.log("train_cvr_loss", cvr_loss)
         self.log("train_contrastive_loss", contrastive_loss)
         self.log("train_relatedness_loss", rel_loss)
+        self.log("train_hard_ctr_ratio", hard_ctr_ratio)
+        self.log("train_hard_cvr_ratio", hard_cvr_ratio)
         return total_loss
 
     def validation_step(self, batch, batch_idx):
@@ -1553,7 +1632,9 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
             cvr_loss,
             contrastive_loss,
             rel_loss,
-        ) = self._compute_losses(batch)
+            hard_ctr_ratio,
+            hard_cvr_ratio,
+        ) = self._compute_losses(batch, for_training=False)
 
         loss = (
             self.ctr_weight * ctr_loss
@@ -1579,6 +1660,8 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         self.log("val_cvr_loss", cvr_loss, sync_dist=True)
         self.log("val_contrastive_loss", contrastive_loss, sync_dist=True)
         self.log("val_relatedness_loss", rel_loss, sync_dist=True)
+        self.log("val_hard_ctr_ratio", hard_ctr_ratio, sync_dist=True)
+        self.log("val_hard_cvr_ratio", hard_cvr_ratio, sync_dist=True)
         return loss
 
     def test_step(self, batch, batch_idx):
@@ -1591,7 +1674,9 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
             cvr_loss,
             contrastive_loss,
             rel_loss,
-        ) = self._compute_losses(batch)
+            hard_ctr_ratio,
+            hard_cvr_ratio,
+        ) = self._compute_losses(batch, for_training=False)
 
         loss = (
             self.ctr_weight * ctr_loss
@@ -1617,4 +1702,6 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         self.log("test_cvr_loss", cvr_loss, sync_dist=True)
         self.log("test_contrastive_loss", contrastive_loss, sync_dist=True)
         self.log("test_relatedness_loss", rel_loss, sync_dist=True)
+        self.log("test_hard_ctr_ratio", hard_ctr_ratio, sync_dist=True)
+        self.log("test_hard_cvr_ratio", hard_cvr_ratio, sync_dist=True)
         return loss

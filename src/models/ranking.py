@@ -15,6 +15,7 @@ TorchJD 梯度聚合通过以下两个参数统一控制：
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Dict, List
 from torchjd.aggregation import UPGrad, MGDA, PCGrad, GradDrop
@@ -1272,3 +1273,348 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
             cvr_in = new_cvr
 
         return self.ctr_tower(ctr_in), self.cvr_tower(cvr_in)
+
+
+class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
+    """
+    AdaFTR 风格的样本内对比学习多任务模型（MMOE backbone）。
+
+    数据流：
+      input -> (optional DCN cross + concat) -> MMOE -> h_ctr/h_cvr
+            -> ctr/cvr heads
+            -> contrastive loss + relatedness network (dynamic temperature)
+    """
+
+    def __init__(
+        self,
+        sparse_feature_names: List[str],
+        sparse_feature_dims : Dict[str, int],
+        dense_feature_names : List[str],
+        embedding_dim       : int       = 32,
+        num_experts         : int       = 8,
+        expert_hidden_dims  : List[int] = [256, 128],
+        tower_hidden_dims   : List[int] = [64],
+        dropout             : float     = 0.2,
+        learning_rate       : float     = 1e-3,
+        ctr_weight          : float     = 0.5,
+        cvr_weight          : float     = 0.5,
+        use_torchjd         : bool      = False,
+        aggregation_method  : str       = "upgrad",
+        esmm                : bool      = False,
+        sigmoid             : int       = 1,
+        use_entropy_reg     : bool      = False,
+        lambda_entropy      : float     = 0.01,
+        use_ema             : bool      = False,
+        ema_decay           : float     = 0.999,
+        use_dcn             : bool      = False,
+        dcn_num_layers      : int       = 2,
+        dcn_dropout         : float     = 0.0,
+        dcn_rank            : int       = 0,
+        alpha_contrastive   : float     = 0.1,
+        tau_min             : float     = 0.05,
+        tau_max             : float     = 0.50,
+        relatedness_hidden_dim: int     = 64,
+        lambda_rel          : float     = 0.1,
+    ):
+        pl.LightningModule.__init__(self)
+        self.save_hyperparameters()
+        self.learning_rate = learning_rate
+
+        input_dim = self._build_feature_layers(
+            sparse_feature_names, sparse_feature_dims, dense_feature_names, embedding_dim,
+        )
+
+        # AdaFTR 论文配置：MMOE backbone expert 输出维度固定为 256
+        backbone_dim = expert_hidden_dims[0] if len(expert_hidden_dims) > 0 else 256
+
+        # 特征交叉前置（可选）：x -> cross(x) -> concat([cross_x, x]) -> MMOE
+        self.use_dcn = use_dcn
+        if use_dcn:
+            self.feature_cross = DCNv2CrossLayer(
+                input_dim,
+                num_layers=dcn_num_layers,
+                dropout=dcn_dropout,
+                rank=dcn_rank,
+            )
+            mmoe_input_dim = input_dim * 2
+        else:
+            self.feature_cross = None
+            mmoe_input_dim = input_dim
+
+        # MMOE backbone
+        self.experts = nn.ModuleList([
+            Expert(mmoe_input_dim, [backbone_dim], dropout)
+            for _ in range(num_experts)
+        ])
+        self.ctr_gate = Gate(mmoe_input_dim, num_experts)
+        self.cvr_gate = Gate(mmoe_input_dim, num_experts)
+
+        # AdaFTR task-specific layers: [256, 128, 64]
+        if len(tower_hidden_dims) < 3:
+            tower_hidden_dims = [256, 128, 64]
+        self.rep_ctr = self._build_rep_layer(backbone_dim, tower_hidden_dims, dropout)
+        self.rep_cvr = self._build_rep_layer(backbone_dim, tower_hidden_dims, dropout)
+        rep_dim = tower_hidden_dims[-1]
+
+        # CTR/CVR heads
+        self.ctr_head = nn.Linear(rep_dim, 1)
+        self.cvr_head = nn.Linear(rep_dim, 1)
+
+        # Relatedness network: input = [abs(h_ctr-h_cvr), h_ctr*h_cvr]
+        self.relatedness_net = nn.Sequential(
+            nn.Linear(rep_dim * 2, relatedness_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(relatedness_hidden_dim, 1),
+        )
+
+        # AdaFTR hyperparameters
+        self.alpha_contrastive = alpha_contrastive
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.lambda_rel = lambda_rel
+
+        # 与其它模型保持一致的训练基础能力（TorchJD / EMA / metrics）
+        self._init_torchjd(
+            use_torchjd,
+            aggregation_method,
+            ctr_weight,
+            cvr_weight,
+            esmm,
+            sigmoid,
+            use_entropy_reg=False,
+            lambda_entropy=0.0,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+        )
+        self._init_metrics()
+
+    def _build_rep_layer(self, input_dim: int, hidden_dims: List[int], dropout: float):
+        layers = []
+        dims = [input_dim] + hidden_dims
+        for i in range(len(dims) - 1):
+            layers += [
+                nn.Linear(dims[i], dims[i + 1]),
+                nn.BatchNorm1d(dims[i + 1]),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ]
+        return nn.Sequential(*layers)
+
+    def _forward_adaftr(self, x: torch.Tensor):
+        if self.use_dcn:
+            cross_x = self.feature_cross(x)
+            x = torch.cat([cross_x, x], dim=-1)
+
+        expert_outputs = torch.stack([e(x) for e in self.experts], dim=1)  # [B, E, d]
+
+        ctr_weights = self.ctr_gate(x).unsqueeze(-1)
+        cvr_weights = self.cvr_gate(x).unsqueeze(-1)
+        ctr_backbone = torch.sum(expert_outputs * ctr_weights, dim=1)  # [B, d]
+        cvr_backbone = torch.sum(expert_outputs * cvr_weights, dim=1)  # [B, d]
+
+        h_ctr = self.rep_ctr(ctr_backbone)  # [B, 64]
+        h_cvr = self.rep_cvr(cvr_backbone)  # [B, 64]
+
+        ctr_logit = self.ctr_head(h_ctr).squeeze(-1)  # [B]
+        cvr_logit = self.cvr_head(h_cvr).squeeze(-1)  # [B]
+
+        # 关联性网络输入必须截断梯度（AdaFTR 要点）
+        diff = torch.abs(h_ctr.detach() - h_cvr.detach())
+        prod = h_ctr.detach() * h_cvr.detach()
+        fusion = torch.cat([diff, prod], dim=-1)  # [B, 2D]
+
+        relatedness_logit = self.relatedness_net(fusion).squeeze(-1)  # [B]
+        temperature = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(relatedness_logit)
+
+        return ctr_logit, cvr_logit, h_ctr, h_cvr, relatedness_logit, temperature
+
+    def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
+        ctr_logit, cvr_logit, _, _, _, _ = self._forward_adaftr(x)
+        if return_gate_entropy:
+            dummy_entropy = torch.zeros_like(ctr_logit)
+            return ctr_logit.unsqueeze(-1), cvr_logit.unsqueeze(-1), dummy_entropy
+        return ctr_logit.unsqueeze(-1), cvr_logit.unsqueeze(-1)
+
+    def _contrastive_loss(self, h_ctr: torch.Tensor, h_cvr: torch.Tensor, temperature: torch.Tensor):
+        h_ctr = F.normalize(h_ctr, dim=-1, eps=1e-8)
+        h_cvr = F.normalize(h_cvr, dim=-1, eps=1e-8)
+
+        sim = torch.matmul(h_ctr, h_cvr.T)  # [B, B]
+        sim = sim / temperature.unsqueeze(1)
+
+        labels = torch.arange(sim.size(0), device=sim.device)
+        return F.cross_entropy(sim, labels)
+
+    def _compute_losses(self, batch):
+        inputs, labels = batch
+        ctr_labels = labels["click"].float()
+        cvr_labels = labels["purchase"].float()
+
+        x = self._encode_features(inputs)
+        ctr_logits, cvr_logits, h_ctr, h_cvr, rel_logits, temperature = self._forward_adaftr(x)
+
+        pCTR = torch.sigmoid(ctr_logits)
+        if self.sigmoid == 1:
+            pCVR = torch.sigmoid(cvr_logits)
+        else:
+            pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
+
+        ctr_loss = nn.functional.binary_cross_entropy_with_logits(ctr_logits, ctr_labels)
+
+        if self.esmm:
+            pCTCVR = pCTR * pCVR
+            cvr_loss = nn.functional.binary_cross_entropy(pCTCVR, cvr_labels)
+        else:
+            click_mask = ctr_labels > 0.5
+            if click_mask.any():
+                cvr_loss = nn.functional.binary_cross_entropy_with_logits(
+                    cvr_logits[click_mask], cvr_labels[click_mask]
+                )
+            else:
+                cvr_loss = torch.tensor(0.0, device=ctr_logits.device)
+
+        contrastive_loss = self._contrastive_loss(h_ctr, h_cvr, temperature)
+
+        # y_rel = 1 if y_ctr == y_cvr else 0
+        rel_target = (ctr_labels == cvr_labels).float()
+        rel_loss = nn.functional.binary_cross_entropy_with_logits(rel_logits, rel_target)
+
+        return (
+            ctr_logits,
+            cvr_logits,
+            ctr_labels,
+            cvr_labels,
+            ctr_loss,
+            cvr_loss,
+            contrastive_loss,
+            rel_loss,
+        )
+
+    def _training_step_standard(self, batch):
+        (
+            _,
+            _,
+            _,
+            _,
+            ctr_loss,
+            cvr_loss,
+            contrastive_loss,
+            rel_loss,
+        ) = self._compute_losses(batch)
+
+        loss = (
+            self.ctr_weight * ctr_loss
+            + self.cvr_weight * cvr_loss
+            + self.alpha_contrastive * contrastive_loss
+            + self.lambda_rel * rel_loss
+        )
+        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_ctr_loss", ctr_loss)
+        self.log("train_cvr_loss", cvr_loss)
+        self.log("train_contrastive_loss", contrastive_loss)
+        self.log("train_relatedness_loss", rel_loss)
+        return loss
+
+    def _training_step_torchjd(self, batch):
+        optimizer = self.optimizers()
+        optimizer.zero_grad()
+
+        (
+            _,
+            _,
+            _,
+            _,
+            ctr_loss,
+            cvr_loss,
+            contrastive_loss,
+            rel_loss,
+        ) = self._compute_losses(batch)
+
+        backward([ctr_loss, cvr_loss], aggregator=self.aggregator)
+        aux_loss = self.alpha_contrastive * contrastive_loss + self.lambda_rel * rel_loss
+        aux_loss.backward()
+        optimizer.step()
+
+        total_loss = ctr_loss + cvr_loss + aux_loss
+        self.log("train_loss", total_loss, prog_bar=True)
+        self.log("train_ctr_loss", ctr_loss)
+        self.log("train_cvr_loss", cvr_loss)
+        self.log("train_contrastive_loss", contrastive_loss)
+        self.log("train_relatedness_loss", rel_loss)
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        (
+            ctr_logits,
+            cvr_logits,
+            ctr_labels,
+            cvr_labels,
+            ctr_loss,
+            cvr_loss,
+            contrastive_loss,
+            rel_loss,
+        ) = self._compute_losses(batch)
+
+        loss = (
+            self.ctr_weight * ctr_loss
+            + self.cvr_weight * cvr_loss
+            + self.alpha_contrastive * contrastive_loss
+            + self.lambda_rel * rel_loss
+        )
+
+        self._update_auc_metrics(
+            ctr_logits, cvr_logits, ctr_labels, cvr_labels, self.val_ctr_auc, self.val_cvr_auc
+        )
+
+        if self.use_ema and hasattr(self, "_ema_params"):
+            inputs, _ = batch
+            ema_ctr_logits, ema_cvr_logits = self._forward_with_ema(inputs)
+            self._update_auc_metrics(
+                ema_ctr_logits, ema_cvr_logits, ctr_labels, cvr_labels,
+                self.val_ema_ctr_auc, self.val_ema_cvr_auc
+            )
+
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val_ctr_loss", ctr_loss, sync_dist=True)
+        self.log("val_cvr_loss", cvr_loss, sync_dist=True)
+        self.log("val_contrastive_loss", contrastive_loss, sync_dist=True)
+        self.log("val_relatedness_loss", rel_loss, sync_dist=True)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        (
+            ctr_logits,
+            cvr_logits,
+            ctr_labels,
+            cvr_labels,
+            ctr_loss,
+            cvr_loss,
+            contrastive_loss,
+            rel_loss,
+        ) = self._compute_losses(batch)
+
+        loss = (
+            self.ctr_weight * ctr_loss
+            + self.cvr_weight * cvr_loss
+            + self.alpha_contrastive * contrastive_loss
+            + self.lambda_rel * rel_loss
+        )
+
+        self._update_auc_metrics(
+            ctr_logits, cvr_logits, ctr_labels, cvr_labels, self.test_ctr_auc, self.test_cvr_auc
+        )
+
+        if self.use_ema and hasattr(self, "_ema_params"):
+            inputs, _ = batch
+            ema_ctr_logits, ema_cvr_logits = self._forward_with_ema(inputs)
+            self._update_auc_metrics(
+                ema_ctr_logits, ema_cvr_logits, ctr_labels, cvr_labels,
+                self.test_ema_ctr_auc, self.test_ema_cvr_auc
+            )
+
+        self.log("test_loss", loss, sync_dist=True)
+        self.log("test_ctr_loss", ctr_loss, sync_dist=True)
+        self.log("test_cvr_loss", cvr_loss, sync_dist=True)
+        self.log("test_contrastive_loss", contrastive_loss, sync_dist=True)
+        self.log("test_relatedness_loss", rel_loss, sync_dist=True)
+        return loss

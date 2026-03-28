@@ -9,7 +9,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 import pandas as pd
 from pathlib import Path
 
-from src.models.ranking import ShareBottomModel, MOEModel, MMOEModel, PLEModel
+from src.models.ranking import ShareBottomModel, MOEModel, MMOEModel, PLEModel, AdaFTRModel
 from src.data.dataset import RankDataModule
 from src.utils.constants import (
     USER_SPARSE, USER_DENSE,
@@ -24,10 +24,11 @@ MODEL_MAP = {
     'moe'         : MOEModel,
     'mmoe'        : MMOEModel,
     'ple'         : PLEModel,
+    'adaftr'      : AdaFTRModel,
 }
 
 # 仅 MOE / MMOE / PLE 有专家网络相关参数
-EXPERT_MODELS = {'moe', 'mmoe', 'ple'}
+EXPERT_MODELS = {'moe', 'mmoe', 'ple', 'adaftr'}
 
 # 仅 PLE 有的参数
 PLE_MODELS = {'ple'}
@@ -83,6 +84,14 @@ def parse_args():
     parser.add_argument('--num_specific_experts', type=int, default=1, help='每个任务专属专家数量（仅 ple 有效）')
     parser.add_argument('--num_shared_experts', type=int, default=2, help='共享专家数量（仅 ple 有效）')
     parser.add_argument('--num_levels', type=int, default=2, help='CGC 层数（仅 ple 有效，>=1）')
+
+    # ── AdaFTR 专用 ─────────────────────────────────────────────────────────
+    parser.add_argument('--adaftr_tower_hidden_dims', type=int, nargs='+', default=[256, 128, 64], help='AdaFTR 任务特异层维度')
+    parser.add_argument('--alpha_contrastive', type=float, default=0.1, help='AdaFTR 对比损失权重 alpha')
+    parser.add_argument('--tau_min', type=float, default=0.05, help='AdaFTR 动态温度下界')
+    parser.add_argument('--tau_max', type=float, default=0.50, help='AdaFTR 动态温度上界')
+    parser.add_argument('--relatedness_hidden_dim', type=int, default=64, help='AdaFTR 关联性网络隐层维度')
+    parser.add_argument('--lambda_rel', type=float, default=0.1, help='AdaFTR 关联性损失权重')
 
     # ── 数据加载 ────────────────────────────────────────────────────────────
     parser.add_argument('--batch_size', type=int, default=256)
@@ -147,6 +156,21 @@ def build_model(args):
             num_specific_experts = args.num_specific_experts,
             num_shared_experts   = args.num_shared_experts,
             num_levels           = args.num_levels,
+        )
+
+    # AdaFTR 专用参数
+    if args.model == 'adaftr':
+        common_adaftr = {k: v for k, v in common.items() if k != 'tower_hidden_dims'}
+        return model_cls(
+            **common_adaftr,
+            num_experts           = args.num_experts,
+            expert_hidden_dims    = args.expert_hidden_dims,
+            tower_hidden_dims     = args.adaftr_tower_hidden_dims,
+            alpha_contrastive     = args.alpha_contrastive,
+            tau_min               = args.tau_min,
+            tau_max               = args.tau_max,
+            relatedness_hidden_dim= args.relatedness_hidden_dim,
+            lambda_rel            = args.lambda_rel,
         )
 
     # MOE / MMOE 专用参数

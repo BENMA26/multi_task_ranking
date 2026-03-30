@@ -20,6 +20,7 @@ import pytorch_lightning as pl
 from typing import Dict, List
 from torchjd.aggregation import UPGrad, MGDA, PCGrad, GradDrop
 from torchjd.autojac import backward
+from torchjd.autogram import Engine
 from torchmetrics import AUROC
 
 def _create_aggregator(method: str):
@@ -301,6 +302,12 @@ class _MultiTaskMixin:
         lambda_entropy    : float = 0.01,
         use_ema           : bool = False,
         ema_decay         : float = 0.999,
+        use_asym_proj     : bool = False,
+        asym_proj_lambda  : float = 1.0,
+        asym_proj_tau     : float = 0.0,
+        asym_proj_only_10 : bool = False,
+        asym_proj_restore_norm: bool = False,
+        asym_proj_restore_max_scale: float = 5.0,
     ):
         """
         初始化 TorchJD 梯度聚合和 Entropy 正则化参数
@@ -320,9 +327,220 @@ class _MultiTaskMixin:
         self.lambda_entropy  = lambda_entropy
         self.use_ema    = use_ema
         self.ema_decay  = ema_decay
-        if use_torchjd:
+        self.use_asym_proj = use_asym_proj
+        self.asym_proj_lambda = asym_proj_lambda
+        self.asym_proj_tau = asym_proj_tau
+        self.asym_proj_only_10 = asym_proj_only_10
+        self.asym_proj_restore_norm = asym_proj_restore_norm
+        self.asym_proj_restore_max_scale = asym_proj_restore_max_scale
+
+        if use_torchjd and use_asym_proj:
+            raise ValueError("use_torchjd 与 use_asym_proj 不能同时启用")
+
+        if use_torchjd or use_asym_proj:
             self.automatic_optimization = False
+
+        if use_torchjd:
             self.aggregator = _create_aggregator(aggregation_method)
+
+        # 梯度冲突监控（默认关闭，可由 train_rank.py 动态开启）
+        self.configure_grad_conflict_monitor(enabled=False, interval=100)
+
+    def configure_grad_conflict_monitor(self, enabled: bool = False, interval: int = 100):
+        self.monitor_grad_conflict = bool(enabled)
+        self.grad_conflict_interval = max(1, int(interval))
+        self._grad_conflict_engine = None
+        self._grad_conflict_monitor_disabled = False
+        self._grad_conflict_use_autograd_fallback = False
+
+    @staticmethod
+    def _collect_leaf_param_modules(root_module: nn.Module):
+        modules = []
+        for module in root_module.modules():
+            if len(list(module.children())) != 0:
+                continue
+            if any(p.requires_grad for p in module.parameters(recurse=False)):
+                modules.append(module)
+        return modules
+
+    def _get_grad_conflict_monitor_modules(self):
+        # 默认监控整个模型的叶子参数模块；子类可按共享层覆写
+        return self._collect_leaf_param_modules(self)
+
+    def _ensure_grad_conflict_engine(self):
+        if self._grad_conflict_engine is not None:
+            return True
+        modules = self._get_grad_conflict_monitor_modules()
+        if len(modules) == 0:
+            self._grad_conflict_monitor_disabled = True
+            return False
+        self._grad_conflict_engine = Engine(*modules, batch_dim=None)
+        return True
+
+    def _get_grad_conflict_monitor_params(self):
+        params = []
+        seen = set()
+        for module in self._get_grad_conflict_monitor_modules():
+            for p in module.parameters(recurse=False):
+                if not p.requires_grad:
+                    continue
+                pid = id(p)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                params.append(p)
+        return params
+
+    def _compute_conflict_stats(self, loss_a: torch.Tensor, loss_b: torch.Tensor):
+        used_fallback = 0.0
+        dot = None
+        norm_a_sq = None
+        norm_b_sq = None
+
+        if not self._grad_conflict_use_autograd_fallback:
+            if self._grad_conflict_engine is None:
+                if not self._ensure_grad_conflict_engine():
+                    return None
+                # 本步 forward 已结束，首次初始化后从下一步开始监控
+                return None
+            try:
+                gram = self._grad_conflict_engine.compute_gramian(torch.stack([loss_a, loss_b]))
+                dot = gram[0, 1]
+                norm_a_sq = gram[0, 0].clamp_min(0.0)
+                norm_b_sq = gram[1, 1].clamp_min(0.0)
+            except Exception:
+                self._grad_conflict_use_autograd_fallback = True
+                self._grad_conflict_engine = None
+                used_fallback = 1.0
+
+        if self._grad_conflict_use_autograd_fallback:
+            try:
+                params = self._get_grad_conflict_monitor_params()
+                if len(params) == 0:
+                    self._grad_conflict_monitor_disabled = True
+                    return None
+                grads_a_raw = torch.autograd.grad(
+                    loss_a, params, retain_graph=True, allow_unused=True
+                )
+                grads_b_raw = torch.autograd.grad(
+                    loss_b, params, retain_graph=True, allow_unused=True
+                )
+                dot = torch.zeros((), device=loss_a.device)
+                norm_a_sq = torch.zeros((), device=loss_a.device)
+                norm_b_sq = torch.zeros((), device=loss_a.device)
+                for p, g_a, g_b in zip(params, grads_a_raw, grads_b_raw):
+                    g_a = torch.zeros_like(p) if g_a is None else g_a
+                    g_b = torch.zeros_like(p) if g_b is None else g_b
+                    dot = dot + (g_a * g_b).sum()
+                    norm_a_sq = norm_a_sq + (g_a * g_a).sum()
+                    norm_b_sq = norm_b_sq + (g_b * g_b).sum()
+            except Exception:
+                self._grad_conflict_monitor_disabled = True
+                return None
+
+        if dot is None or norm_a_sq is None or norm_b_sq is None:
+            self._grad_conflict_monitor_disabled = True
+            return None
+
+        cos = dot / (torch.sqrt(norm_a_sq * norm_b_sq) + 1e-8)
+        conflict = (dot < 0).float()
+        return dot.detach(), cos.detach(), conflict.detach(), used_fallback
+
+    def _monitor_label_group_conflicts(
+        self,
+        ctr_logits: torch.Tensor,
+        cvr_logits: torch.Tensor,
+        ctr_labels: torch.Tensor,
+        cvr_labels: torch.Tensor,
+    ):
+        ctr_labels_f = ctr_labels.float()
+        cvr_labels_f = cvr_labels.float()
+
+        ctr_loss_vec = nn.functional.binary_cross_entropy_with_logits(
+            ctr_logits, ctr_labels_f, reduction="none"
+        )
+
+        pCTR = torch.sigmoid(ctr_logits)
+        if self.sigmoid == 1:
+            pCVR = torch.sigmoid(cvr_logits)
+        else:
+            pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
+
+        if self.esmm:
+            pCTCVR = pCTR * pCVR
+            task2_loss_vec = nn.functional.binary_cross_entropy(
+                pCTCVR, cvr_labels_f, reduction="none"
+            )
+        else:
+            task2_loss_vec = nn.functional.binary_cross_entropy_with_logits(
+                cvr_logits, cvr_labels_f, reduction="none"
+            )
+
+        group_masks = {
+            "00": (ctr_labels_f < 0.5) & (cvr_labels_f < 0.5),
+            "10": (ctr_labels_f > 0.5) & (cvr_labels_f < 0.5),
+            "11": (ctr_labels_f > 0.5) & (cvr_labels_f > 0.5),
+        }
+
+        batch_size = max(1, int(ctr_labels_f.numel()))
+        for suffix, mask in group_masks.items():
+            count = mask.float().sum()
+            ratio = count / float(batch_size)
+            valid = (count > 0).float()
+
+            self.log(f"train_grad_conflict_count_{suffix}", count, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(f"train_grad_conflict_ratio_{suffix}", ratio, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(f"train_grad_conflict_valid_{suffix}", valid, on_step=True, on_epoch=True, sync_dist=True)
+
+            if count.item() == 0:
+                self.log(f"train_grad_conflict_dot_{suffix}", torch.zeros((), device=ctr_logits.device), on_step=True, on_epoch=True, sync_dist=True)
+                self.log(f"train_grad_conflict_cos_{suffix}", torch.zeros((), device=ctr_logits.device), on_step=True, on_epoch=True, sync_dist=True)
+                self.log(f"train_grad_conflict_rate_{suffix}", torch.zeros((), device=ctr_logits.device), on_step=True, on_epoch=True, sync_dist=True)
+                continue
+
+            ctr_group_loss = (ctr_loss_vec * mask.float()).sum() / count
+            task2_group_loss = (task2_loss_vec * mask.float()).sum() / count
+            stats = self._compute_conflict_stats(ctr_group_loss, task2_group_loss)
+            if stats is None:
+                return
+            dot_g, cos_g, conflict_g, _ = stats
+
+            self.log(f"train_grad_conflict_dot_{suffix}", dot_g, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(f"train_grad_conflict_cos_{suffix}", cos_g, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(f"train_grad_conflict_rate_{suffix}", conflict_g, on_step=True, on_epoch=True, sync_dist=True)
+
+    def _monitor_task_gradient_conflict(
+        self,
+        loss_a: torch.Tensor,
+        loss_b: torch.Tensor,
+        ctr_logits: torch.Tensor | None = None,
+        cvr_logits: torch.Tensor | None = None,
+        ctr_labels: torch.Tensor | None = None,
+        cvr_labels: torch.Tensor | None = None,
+    ):
+        if not self.monitor_grad_conflict or self._grad_conflict_monitor_disabled:
+            return
+
+        if int(self.global_step) % self.grad_conflict_interval != 0:
+            return
+
+        stats = self._compute_conflict_stats(loss_a, loss_b)
+        if stats is None:
+            return
+        dot, cos, conflict, used_fallback = stats
+
+        self.log("train_grad_conflict_dot", dot, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_grad_conflict_cos", cos, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_grad_conflict_rate", conflict, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_grad_conflict_fallback", used_fallback, on_step=True, on_epoch=True, sync_dist=True)
+
+        if (
+            ctr_logits is not None
+            and cvr_logits is not None
+            and ctr_labels is not None
+            and cvr_labels is not None
+        ):
+            self._monitor_label_group_conflicts(ctr_logits, cvr_logits, ctr_labels, cvr_labels)
 
     def _init_metrics(self):
         self.val_ctr_auc  = AUROC(task="binary")
@@ -341,6 +559,9 @@ class _MultiTaskMixin:
 
     def on_fit_start(self):
         """训练开始时初始化 EMA 参数副本"""
+        if self.monitor_grad_conflict:
+            # Engine 需要在 forward 前初始化，才能捕获模块级导数信息
+            self._ensure_grad_conflict_engine()
         if self.use_ema:
             self._ema_params = {
                 name: param.data.clone()
@@ -388,6 +609,8 @@ class _MultiTaskMixin:
     def training_step(self, batch, batch_idx):
         if self.use_torchjd:
             return self._training_step_torchjd(batch)
+        if self.use_asym_proj:
+            return self._training_step_asym_proj(batch)
         return self._training_step_standard(batch)
 
     def _compute_losses(self, batch):
@@ -435,8 +658,27 @@ class _MultiTaskMixin:
 
         return ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss
 
+    def _compute_cvr_loss_vector(self, ctr_logits, cvr_logits, cvr_labels):
+        """逐样本 CVR/CTCVR loss，供按样本类型做梯度操作。"""
+        if self.esmm:
+            pCTR = torch.sigmoid(ctr_logits)
+            if self.sigmoid == 1:
+                pCVR = torch.sigmoid(cvr_logits)
+            else:
+                pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
+            pCTCVR = pCTR * pCVR
+            return nn.functional.binary_cross_entropy(
+                pCTCVR, cvr_labels.float(), reduction="none"
+            )
+        return nn.functional.binary_cross_entropy_with_logits(
+            cvr_logits, cvr_labels.float(), reduction="none"
+        )
+
     def _training_step_standard(self, batch):
-        _, _, _, _, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        self._monitor_task_gradient_conflict(
+            ctr_loss, cvr_loss, ctr_logits, cvr_logits, ctr_labels, cvr_labels
+        )
         loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss + self.lambda_entropy * entropy_loss
         self.log("train_loss",         loss,         prog_bar=True)
         self.log("train_ctr_loss",     ctr_loss)
@@ -447,7 +689,10 @@ class _MultiTaskMixin:
     def _training_step_torchjd(self, batch):
         optimizer = self.optimizers()
         optimizer.zero_grad()
-        _, _, _, _, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        self._monitor_task_gradient_conflict(
+            ctr_loss, cvr_loss, ctr_logits, cvr_logits, ctr_labels, cvr_labels
+        )
         backward([ctr_loss, cvr_loss], aggregator=self.aggregator)
         optimizer.step()
         total_loss = ctr_loss + cvr_loss + self.lambda_entropy * entropy_loss
@@ -455,6 +700,126 @@ class _MultiTaskMixin:
         self.log("train_ctr_loss",     ctr_loss)
         self.log("train_cvr_loss",     cvr_loss)
         self.log("train_entropy_loss", entropy_loss)
+        return total_loss
+
+    def _get_asym_proj_params(self):
+        """返回进行非对称投影的参数集合。子类可重写。"""
+        return []
+
+    def _training_step_asym_proj(self, batch):
+        proj_params = [p for p in self._get_asym_proj_params() if p.requires_grad]
+        if len(proj_params) == 0:
+            raise RuntimeError("use_asym_proj=True 但未提供可投影参数，请重写 _get_asym_proj_params")
+
+        optimizer = self.optimizers()
+        optimizer.zero_grad()
+
+        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        self._monitor_task_gradient_conflict(
+            ctr_loss, cvr_loss, ctr_logits, cvr_logits, ctr_labels, cvr_labels
+        )
+
+        ctr_obj = self.ctr_weight * ctr_loss
+        cvr_obj = self.cvr_weight * cvr_loss
+        entropy_obj = self.lambda_entropy * entropy_loss
+
+        use_only_10 = bool(self.asym_proj_only_10)
+        if use_only_10:
+            cvr_loss_vec = self._compute_cvr_loss_vector(ctr_logits, cvr_logits, cvr_labels)
+            mask_10 = (ctr_labels > 0.5) & (cvr_labels < 0.5)
+            inv_batch = 1.0 / max(1, cvr_loss_vec.numel())
+            cvr_loss_10 = cvr_loss_vec[mask_10].sum() * inv_batch
+            cvr_loss_other = cvr_loss_vec[~mask_10].sum() * inv_batch
+            cvr_obj_proj = self.cvr_weight * cvr_loss_10
+            cvr_obj_other = self.cvr_weight * cvr_loss_other
+        else:
+            cvr_obj_proj = cvr_obj
+            cvr_obj_other = torch.zeros((), device=ctr_loss.device)
+            mask_10 = None
+
+        ctr_grads_raw = torch.autograd.grad(
+            ctr_obj, proj_params, retain_graph=True, allow_unused=True
+        )
+        cvr_proj_grads_raw = torch.autograd.grad(
+            cvr_obj_proj, proj_params, retain_graph=True, allow_unused=True
+        )
+        if use_only_10:
+            cvr_other_grads_raw = torch.autograd.grad(
+                cvr_obj_other, proj_params, retain_graph=True, allow_unused=True
+            )
+        else:
+            cvr_other_grads_raw = [None] * len(proj_params)
+
+        ctr_grads = []
+        cvr_proj_grads = []
+        cvr_other_grads = []
+        dot = torch.zeros((), device=ctr_loss.device)
+        ctr_norm_sq = torch.zeros((), device=ctr_loss.device)
+        cvr_proj_norm_sq = torch.zeros((), device=ctr_loss.device)
+        for p, g_ctr, g_cvr_proj, g_cvr_other in zip(
+            proj_params, ctr_grads_raw, cvr_proj_grads_raw, cvr_other_grads_raw
+        ):
+            g_ctr = torch.zeros_like(p) if g_ctr is None else g_ctr
+            g_cvr_proj = torch.zeros_like(p) if g_cvr_proj is None else g_cvr_proj
+            g_cvr_other = torch.zeros_like(p) if g_cvr_other is None else g_cvr_other
+            ctr_grads.append(g_ctr)
+            cvr_proj_grads.append(g_cvr_proj)
+            cvr_other_grads.append(g_cvr_other)
+            dot = dot + (g_cvr_proj * g_ctr).sum()
+            ctr_norm_sq = ctr_norm_sq + (g_ctr * g_ctr).sum()
+            cvr_proj_norm_sq = cvr_proj_norm_sq + (g_cvr_proj * g_cvr_proj).sum()
+
+        cos = dot / (torch.sqrt(ctr_norm_sq * cvr_proj_norm_sq) + 1e-8)
+        apply_proj = (
+            (dot.item() < 0.0)
+            and (ctr_norm_sq.item() > 0.0)
+            and (cvr_proj_norm_sq.item() > 0.0)
+            and (cos.item() < -self.asym_proj_tau)
+        )
+
+        restore_scale = torch.ones((), device=ctr_loss.device)
+        if apply_proj:
+            coeff = dot / (ctr_norm_sq + 1e-8)
+            pre_proj_norm_sq = cvr_proj_norm_sq
+            cvr_proj_grads = [
+                g_cvr - self.asym_proj_lambda * coeff * g_ctr
+                for g_ctr, g_cvr in zip(ctr_grads, cvr_proj_grads)
+            ]
+            if self.asym_proj_restore_norm:
+                post_proj_norm_sq = torch.zeros((), device=ctr_loss.device)
+                for g_cvr in cvr_proj_grads:
+                    post_proj_norm_sq = post_proj_norm_sq + (g_cvr * g_cvr).sum()
+                if pre_proj_norm_sq.item() > 0.0 and post_proj_norm_sq.item() > 0.0:
+                    restore_scale = torch.sqrt(pre_proj_norm_sq / (post_proj_norm_sq + 1e-8))
+                    max_scale = max(1.0, float(self.asym_proj_restore_max_scale))
+                    restore_scale = torch.clamp(restore_scale, max=max_scale)
+                    cvr_proj_grads = [g_cvr * restore_scale for g_cvr in cvr_proj_grads]
+
+        cvr_grads = [
+            g_other + g_proj
+            for g_other, g_proj in zip(cvr_other_grads, cvr_proj_grads)
+        ]
+
+        total_loss = ctr_obj + cvr_obj + entropy_obj
+        self.manual_backward(total_loss)
+
+        # 仅替换投影参数上的梯度，其余参数保持常规反传结果
+        for p, g_ctr, g_cvr in zip(proj_params, ctr_grads, cvr_grads):
+            p.grad = (g_ctr + g_cvr).detach()
+
+        optimizer.step()
+
+        self.log("train_loss", total_loss, prog_bar=True)
+        self.log("train_ctr_loss", ctr_loss)
+        self.log("train_cvr_loss", cvr_loss)
+        self.log("train_entropy_loss", entropy_loss)
+        self.log("train_asym_grad_dot", dot.detach(), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_asym_grad_cos", cos.detach(), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_asym_proj_applied", float(apply_proj), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_asym_proj_restore_scale", restore_scale.detach(), on_step=False, on_epoch=True, sync_dist=True)
+        if use_only_10 and mask_10 is not None:
+            self.log("train_asym_proj_10_count", mask_10.float().sum(), on_step=False, on_epoch=True, sync_dist=True)
+            self.log("train_asym_proj_10_ratio", mask_10.float().mean(), on_step=False, on_epoch=True, sync_dist=True)
         return total_loss
 
     # ------------------------------------------------------------------ #
@@ -590,6 +955,12 @@ class _MultiTaskMixin:
         lambda_entropy    : float = 0.01,
         use_ema           : bool = False,
         ema_decay         : float = 0.999,
+        use_asym_proj     : bool = False,
+        asym_proj_lambda  : float = 1.0,
+        asym_proj_tau     : float = 0.0,
+        asym_proj_only_10 : bool = False,
+        asym_proj_restore_norm: bool = False,
+        asym_proj_restore_max_scale: float = 5.0,
     ):
         """
         初始化 TorchJD 梯度聚合和 Entropy 正则化参数
@@ -609,9 +980,220 @@ class _MultiTaskMixin:
         self.lambda_entropy  = lambda_entropy
         self.use_ema    = use_ema
         self.ema_decay  = ema_decay
-        if use_torchjd:
+        self.use_asym_proj = use_asym_proj
+        self.asym_proj_lambda = asym_proj_lambda
+        self.asym_proj_tau = asym_proj_tau
+        self.asym_proj_only_10 = asym_proj_only_10
+        self.asym_proj_restore_norm = asym_proj_restore_norm
+        self.asym_proj_restore_max_scale = asym_proj_restore_max_scale
+
+        if use_torchjd and use_asym_proj:
+            raise ValueError("use_torchjd 与 use_asym_proj 不能同时启用")
+
+        if use_torchjd or use_asym_proj:
             self.automatic_optimization = False
+
+        if use_torchjd:
             self.aggregator = _create_aggregator(aggregation_method)
+
+        # 梯度冲突监控（默认关闭，可由 train_rank.py 动态开启）
+        self.configure_grad_conflict_monitor(enabled=False, interval=100)
+
+    def configure_grad_conflict_monitor(self, enabled: bool = False, interval: int = 100):
+        self.monitor_grad_conflict = bool(enabled)
+        self.grad_conflict_interval = max(1, int(interval))
+        self._grad_conflict_engine = None
+        self._grad_conflict_monitor_disabled = False
+        self._grad_conflict_use_autograd_fallback = False
+
+    @staticmethod
+    def _collect_leaf_param_modules(root_module: nn.Module):
+        modules = []
+        for module in root_module.modules():
+            if len(list(module.children())) != 0:
+                continue
+            if any(p.requires_grad for p in module.parameters(recurse=False)):
+                modules.append(module)
+        return modules
+
+    def _get_grad_conflict_monitor_modules(self):
+        # 默认监控整个模型的叶子参数模块；子类可按共享层覆写
+        return self._collect_leaf_param_modules(self)
+
+    def _ensure_grad_conflict_engine(self):
+        if self._grad_conflict_engine is not None:
+            return True
+        modules = self._get_grad_conflict_monitor_modules()
+        if len(modules) == 0:
+            self._grad_conflict_monitor_disabled = True
+            return False
+        self._grad_conflict_engine = Engine(*modules, batch_dim=None)
+        return True
+
+    def _get_grad_conflict_monitor_params(self):
+        params = []
+        seen = set()
+        for module in self._get_grad_conflict_monitor_modules():
+            for p in module.parameters(recurse=False):
+                if not p.requires_grad:
+                    continue
+                pid = id(p)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                params.append(p)
+        return params
+
+    def _compute_conflict_stats(self, loss_a: torch.Tensor, loss_b: torch.Tensor):
+        used_fallback = 0.0
+        dot = None
+        norm_a_sq = None
+        norm_b_sq = None
+
+        if not self._grad_conflict_use_autograd_fallback:
+            if self._grad_conflict_engine is None:
+                if not self._ensure_grad_conflict_engine():
+                    return None
+                # 本步 forward 已结束，首次初始化后从下一步开始监控
+                return None
+            try:
+                gram = self._grad_conflict_engine.compute_gramian(torch.stack([loss_a, loss_b]))
+                dot = gram[0, 1]
+                norm_a_sq = gram[0, 0].clamp_min(0.0)
+                norm_b_sq = gram[1, 1].clamp_min(0.0)
+            except Exception:
+                self._grad_conflict_use_autograd_fallback = True
+                self._grad_conflict_engine = None
+                used_fallback = 1.0
+
+        if self._grad_conflict_use_autograd_fallback:
+            try:
+                params = self._get_grad_conflict_monitor_params()
+                if len(params) == 0:
+                    self._grad_conflict_monitor_disabled = True
+                    return None
+                grads_a_raw = torch.autograd.grad(
+                    loss_a, params, retain_graph=True, allow_unused=True
+                )
+                grads_b_raw = torch.autograd.grad(
+                    loss_b, params, retain_graph=True, allow_unused=True
+                )
+                dot = torch.zeros((), device=loss_a.device)
+                norm_a_sq = torch.zeros((), device=loss_a.device)
+                norm_b_sq = torch.zeros((), device=loss_a.device)
+                for p, g_a, g_b in zip(params, grads_a_raw, grads_b_raw):
+                    g_a = torch.zeros_like(p) if g_a is None else g_a
+                    g_b = torch.zeros_like(p) if g_b is None else g_b
+                    dot = dot + (g_a * g_b).sum()
+                    norm_a_sq = norm_a_sq + (g_a * g_a).sum()
+                    norm_b_sq = norm_b_sq + (g_b * g_b).sum()
+            except Exception:
+                self._grad_conflict_monitor_disabled = True
+                return None
+
+        if dot is None or norm_a_sq is None or norm_b_sq is None:
+            self._grad_conflict_monitor_disabled = True
+            return None
+
+        cos = dot / (torch.sqrt(norm_a_sq * norm_b_sq) + 1e-8)
+        conflict = (dot < 0).float()
+        return dot.detach(), cos.detach(), conflict.detach(), used_fallback
+
+    def _monitor_label_group_conflicts(
+        self,
+        ctr_logits: torch.Tensor,
+        cvr_logits: torch.Tensor,
+        ctr_labels: torch.Tensor,
+        cvr_labels: torch.Tensor,
+    ):
+        ctr_labels_f = ctr_labels.float()
+        cvr_labels_f = cvr_labels.float()
+
+        ctr_loss_vec = nn.functional.binary_cross_entropy_with_logits(
+            ctr_logits, ctr_labels_f, reduction="none"
+        )
+
+        pCTR = torch.sigmoid(ctr_logits)
+        if self.sigmoid == 1:
+            pCVR = torch.sigmoid(cvr_logits)
+        else:
+            pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
+
+        if self.esmm:
+            pCTCVR = pCTR * pCVR
+            task2_loss_vec = nn.functional.binary_cross_entropy(
+                pCTCVR, cvr_labels_f, reduction="none"
+            )
+        else:
+            task2_loss_vec = nn.functional.binary_cross_entropy_with_logits(
+                cvr_logits, cvr_labels_f, reduction="none"
+            )
+
+        group_masks = {
+            "00": (ctr_labels_f < 0.5) & (cvr_labels_f < 0.5),
+            "10": (ctr_labels_f > 0.5) & (cvr_labels_f < 0.5),
+            "11": (ctr_labels_f > 0.5) & (cvr_labels_f > 0.5),
+        }
+
+        batch_size = max(1, int(ctr_labels_f.numel()))
+        for suffix, mask in group_masks.items():
+            count = mask.float().sum()
+            ratio = count / float(batch_size)
+            valid = (count > 0).float()
+
+            self.log(f"train_grad_conflict_count_{suffix}", count, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(f"train_grad_conflict_ratio_{suffix}", ratio, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(f"train_grad_conflict_valid_{suffix}", valid, on_step=True, on_epoch=True, sync_dist=True)
+
+            if count.item() == 0:
+                self.log(f"train_grad_conflict_dot_{suffix}", torch.zeros((), device=ctr_logits.device), on_step=True, on_epoch=True, sync_dist=True)
+                self.log(f"train_grad_conflict_cos_{suffix}", torch.zeros((), device=ctr_logits.device), on_step=True, on_epoch=True, sync_dist=True)
+                self.log(f"train_grad_conflict_rate_{suffix}", torch.zeros((), device=ctr_logits.device), on_step=True, on_epoch=True, sync_dist=True)
+                continue
+
+            ctr_group_loss = (ctr_loss_vec * mask.float()).sum() / count
+            task2_group_loss = (task2_loss_vec * mask.float()).sum() / count
+            stats = self._compute_conflict_stats(ctr_group_loss, task2_group_loss)
+            if stats is None:
+                return
+            dot_g, cos_g, conflict_g, _ = stats
+
+            self.log(f"train_grad_conflict_dot_{suffix}", dot_g, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(f"train_grad_conflict_cos_{suffix}", cos_g, on_step=True, on_epoch=True, sync_dist=True)
+            self.log(f"train_grad_conflict_rate_{suffix}", conflict_g, on_step=True, on_epoch=True, sync_dist=True)
+
+    def _monitor_task_gradient_conflict(
+        self,
+        loss_a: torch.Tensor,
+        loss_b: torch.Tensor,
+        ctr_logits: torch.Tensor | None = None,
+        cvr_logits: torch.Tensor | None = None,
+        ctr_labels: torch.Tensor | None = None,
+        cvr_labels: torch.Tensor | None = None,
+    ):
+        if not self.monitor_grad_conflict or self._grad_conflict_monitor_disabled:
+            return
+
+        if int(self.global_step) % self.grad_conflict_interval != 0:
+            return
+
+        stats = self._compute_conflict_stats(loss_a, loss_b)
+        if stats is None:
+            return
+        dot, cos, conflict, used_fallback = stats
+
+        self.log("train_grad_conflict_dot", dot, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_grad_conflict_cos", cos, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_grad_conflict_rate", conflict, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_grad_conflict_fallback", used_fallback, on_step=True, on_epoch=True, sync_dist=True)
+
+        if (
+            ctr_logits is not None
+            and cvr_logits is not None
+            and ctr_labels is not None
+            and cvr_labels is not None
+        ):
+            self._monitor_label_group_conflicts(ctr_logits, cvr_logits, ctr_labels, cvr_labels)
 
     def _init_metrics(self):
         self.val_ctr_auc  = AUROC(task="binary")
@@ -630,6 +1212,9 @@ class _MultiTaskMixin:
 
     def on_fit_start(self):
         """训练开始时初始化 EMA 参数副本"""
+        if self.monitor_grad_conflict:
+            # Engine 需要在 forward 前初始化，才能捕获模块级导数信息
+            self._ensure_grad_conflict_engine()
         if self.use_ema:
             self._ema_params = {
                 name: param.data.clone()
@@ -677,6 +1262,8 @@ class _MultiTaskMixin:
     def training_step(self, batch, batch_idx):
         if self.use_torchjd:
             return self._training_step_torchjd(batch)
+        if self.use_asym_proj:
+            return self._training_step_asym_proj(batch)
         return self._training_step_standard(batch)
 
     def _compute_losses(self, batch):
@@ -725,7 +1312,10 @@ class _MultiTaskMixin:
         return ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss
 
     def _training_step_standard(self, batch):
-        _, _, _, _, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        self._monitor_task_gradient_conflict(
+            ctr_loss, cvr_loss, ctr_logits, cvr_logits, ctr_labels, cvr_labels
+        )
         loss = self.ctr_weight * ctr_loss + self.cvr_weight * cvr_loss + self.lambda_entropy * entropy_loss
         self.log("train_loss",         loss,         prog_bar=True)
         self.log("train_ctr_loss",     ctr_loss)
@@ -736,7 +1326,10 @@ class _MultiTaskMixin:
     def _training_step_torchjd(self, batch):
         optimizer = self.optimizers()
         optimizer.zero_grad()
-        _, _, _, _, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        self._monitor_task_gradient_conflict(
+            ctr_loss, cvr_loss, ctr_logits, cvr_logits, ctr_labels, cvr_labels
+        )
         backward([ctr_loss, cvr_loss], aggregator=self.aggregator)
         optimizer.step()
         total_loss = ctr_loss + cvr_loss + self.lambda_entropy * entropy_loss
@@ -744,6 +1337,126 @@ class _MultiTaskMixin:
         self.log("train_ctr_loss",     ctr_loss)
         self.log("train_cvr_loss",     cvr_loss)
         self.log("train_entropy_loss", entropy_loss)
+        return total_loss
+
+    def _get_asym_proj_params(self):
+        """返回进行非对称投影的参数集合。子类可重写。"""
+        return []
+
+    def _training_step_asym_proj(self, batch):
+        proj_params = [p for p in self._get_asym_proj_params() if p.requires_grad]
+        if len(proj_params) == 0:
+            raise RuntimeError("use_asym_proj=True 但未提供可投影参数，请重写 _get_asym_proj_params")
+
+        optimizer = self.optimizers()
+        optimizer.zero_grad()
+
+        ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss = self._compute_losses(batch)
+        self._monitor_task_gradient_conflict(
+            ctr_loss, cvr_loss, ctr_logits, cvr_logits, ctr_labels, cvr_labels
+        )
+
+        ctr_obj = self.ctr_weight * ctr_loss
+        cvr_obj = self.cvr_weight * cvr_loss
+        entropy_obj = self.lambda_entropy * entropy_loss
+
+        use_only_10 = bool(self.asym_proj_only_10)
+        if use_only_10:
+            cvr_loss_vec = self._compute_cvr_loss_vector(ctr_logits, cvr_logits, cvr_labels)
+            mask_10 = (ctr_labels > 0.5) & (cvr_labels < 0.5)
+            inv_batch = 1.0 / max(1, cvr_loss_vec.numel())
+            cvr_loss_10 = cvr_loss_vec[mask_10].sum() * inv_batch
+            cvr_loss_other = cvr_loss_vec[~mask_10].sum() * inv_batch
+            cvr_obj_proj = self.cvr_weight * cvr_loss_10
+            cvr_obj_other = self.cvr_weight * cvr_loss_other
+        else:
+            cvr_obj_proj = cvr_obj
+            cvr_obj_other = torch.zeros((), device=ctr_loss.device)
+            mask_10 = None
+
+        ctr_grads_raw = torch.autograd.grad(
+            ctr_obj, proj_params, retain_graph=True, allow_unused=True
+        )
+        cvr_proj_grads_raw = torch.autograd.grad(
+            cvr_obj_proj, proj_params, retain_graph=True, allow_unused=True
+        )
+        if use_only_10:
+            cvr_other_grads_raw = torch.autograd.grad(
+                cvr_obj_other, proj_params, retain_graph=True, allow_unused=True
+            )
+        else:
+            cvr_other_grads_raw = [None] * len(proj_params)
+
+        ctr_grads = []
+        cvr_proj_grads = []
+        cvr_other_grads = []
+        dot = torch.zeros((), device=ctr_loss.device)
+        ctr_norm_sq = torch.zeros((), device=ctr_loss.device)
+        cvr_proj_norm_sq = torch.zeros((), device=ctr_loss.device)
+        for p, g_ctr, g_cvr_proj, g_cvr_other in zip(
+            proj_params, ctr_grads_raw, cvr_proj_grads_raw, cvr_other_grads_raw
+        ):
+            g_ctr = torch.zeros_like(p) if g_ctr is None else g_ctr
+            g_cvr_proj = torch.zeros_like(p) if g_cvr_proj is None else g_cvr_proj
+            g_cvr_other = torch.zeros_like(p) if g_cvr_other is None else g_cvr_other
+            ctr_grads.append(g_ctr)
+            cvr_proj_grads.append(g_cvr_proj)
+            cvr_other_grads.append(g_cvr_other)
+            dot = dot + (g_cvr_proj * g_ctr).sum()
+            ctr_norm_sq = ctr_norm_sq + (g_ctr * g_ctr).sum()
+            cvr_proj_norm_sq = cvr_proj_norm_sq + (g_cvr_proj * g_cvr_proj).sum()
+
+        cos = dot / (torch.sqrt(ctr_norm_sq * cvr_proj_norm_sq) + 1e-8)
+        apply_proj = (
+            (dot.item() < 0.0)
+            and (ctr_norm_sq.item() > 0.0)
+            and (cvr_proj_norm_sq.item() > 0.0)
+            and (cos.item() < -self.asym_proj_tau)
+        )
+
+        restore_scale = torch.ones((), device=ctr_loss.device)
+        if apply_proj:
+            coeff = dot / (ctr_norm_sq + 1e-8)
+            pre_proj_norm_sq = cvr_proj_norm_sq
+            cvr_proj_grads = [
+                g_cvr - self.asym_proj_lambda * coeff * g_ctr
+                for g_ctr, g_cvr in zip(ctr_grads, cvr_proj_grads)
+            ]
+            if self.asym_proj_restore_norm:
+                post_proj_norm_sq = torch.zeros((), device=ctr_loss.device)
+                for g_cvr in cvr_proj_grads:
+                    post_proj_norm_sq = post_proj_norm_sq + (g_cvr * g_cvr).sum()
+                if pre_proj_norm_sq.item() > 0.0 and post_proj_norm_sq.item() > 0.0:
+                    restore_scale = torch.sqrt(pre_proj_norm_sq / (post_proj_norm_sq + 1e-8))
+                    max_scale = max(1.0, float(self.asym_proj_restore_max_scale))
+                    restore_scale = torch.clamp(restore_scale, max=max_scale)
+                    cvr_proj_grads = [g_cvr * restore_scale for g_cvr in cvr_proj_grads]
+
+        cvr_grads = [
+            g_other + g_proj
+            for g_other, g_proj in zip(cvr_other_grads, cvr_proj_grads)
+        ]
+
+        total_loss = ctr_obj + cvr_obj + entropy_obj
+        self.manual_backward(total_loss)
+
+        # 仅替换投影参数上的梯度，其余参数保持常规反传结果
+        for p, g_ctr, g_cvr in zip(proj_params, ctr_grads, cvr_grads):
+            p.grad = (g_ctr + g_cvr).detach()
+
+        optimizer.step()
+
+        self.log("train_loss", total_loss, prog_bar=True)
+        self.log("train_ctr_loss", ctr_loss)
+        self.log("train_cvr_loss", cvr_loss)
+        self.log("train_entropy_loss", entropy_loss)
+        self.log("train_asym_grad_dot", dot.detach(), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_asym_grad_cos", cos.detach(), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_asym_proj_applied", float(apply_proj), on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_asym_proj_restore_scale", restore_scale.detach(), on_step=False, on_epoch=True, sync_dist=True)
+        if use_only_10 and mask_10 is not None:
+            self.log("train_asym_proj_10_count", mask_10.float().sum(), on_step=False, on_epoch=True, sync_dist=True)
+            self.log("train_asym_proj_10_ratio", mask_10.float().mean(), on_step=False, on_epoch=True, sync_dist=True)
         return total_loss
 
     # ------------------------------------------------------------------ #
@@ -888,12 +1601,20 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         aggregation_method  : str       = "upgrad",
         esmm                : bool      = False,
         sigmoid             : int       = 1,
+        use_entropy_reg     : bool      = False,
+        lambda_entropy      : float     = 0.01,
         use_ema             : bool      = False,
         ema_decay           : float     = 0.999,
         use_dcn             : bool      = False,
         dcn_num_layers      : int       = 2,
         dcn_dropout         : float     = 0.0,
         dcn_rank            : int       = 0,
+        use_asym_proj       : bool      = False,
+        asym_proj_lambda    : float     = 1.0,
+        asym_proj_tau       : float     = 0.0,
+        asym_proj_only_10   : bool      = False,
+        asym_proj_restore_norm: bool    = False,
+        asym_proj_restore_max_scale: float = 5.0,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -911,12 +1632,52 @@ class ShareBottomModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(shared_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(shared_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_ema=use_ema, ema_decay=ema_decay)
+        self._init_torchjd(
+            use_torchjd,
+            aggregation_method,
+            ctr_weight,
+            cvr_weight,
+            esmm,
+            sigmoid,
+            use_entropy_reg=use_entropy_reg,
+            lambda_entropy=lambda_entropy,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+            use_asym_proj=use_asym_proj,
+            asym_proj_lambda=asym_proj_lambda,
+            asym_proj_tau=asym_proj_tau,
+            asym_proj_only_10=asym_proj_only_10,
+            asym_proj_restore_norm=asym_proj_restore_norm,
+            asym_proj_restore_max_scale=asym_proj_restore_max_scale,
+        )
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
         shared_out = self.shared_bottom(x)
         return self.ctr_tower(shared_out), self.cvr_tower(shared_out)
+
+    def _get_grad_conflict_monitor_modules(self):
+        # ShareBottom 仅监控共享底层参数上的任务冲突
+        return self._collect_leaf_param_modules(self.shared_bottom)
+
+    def _get_asym_proj_params(self):
+        # ShareBottom 的梯度冲突主要发生在共享底层上
+        return list(self.shared_bottom.parameters())
+
+    def _compute_cvr_loss_vector(self, ctr_logits, cvr_logits, cvr_labels):
+        if self.esmm:
+            pCTR = torch.sigmoid(ctr_logits)
+            if self.sigmoid == 1:
+                pCVR = torch.sigmoid(cvr_logits)
+            else:
+                pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
+            pCTCVR = pCTR * pCVR
+            return nn.functional.binary_cross_entropy(
+                pCTCVR, cvr_labels.float(), reduction="none"
+            )
+        return nn.functional.binary_cross_entropy_with_logits(
+            cvr_logits, cvr_labels.float(), reduction="none"
+        )
 
 class MOEModel(_MultiTaskMixin, pl.LightningModule):
     """
@@ -1045,6 +1806,12 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         dcn_num_layers      : int       = 2,
         dcn_dropout         : float     = 0.0,
         dcn_rank            : int       = 0,
+        use_asym_proj       : bool      = False,
+        asym_proj_lambda    : float     = 1.0,
+        asym_proj_tau       : float     = 0.0,
+        asym_proj_only_10   : bool      = False,
+        asym_proj_restore_norm: bool    = False,
+        asym_proj_restore_max_scale: float = 5.0,
         use_hard_sample     : bool      = False,
         hard_sample_ratio   : float     = 0.2,
         hard_sample_weight  : float     = 2.0,
@@ -1090,7 +1857,24 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_entropy_reg, lambda_entropy, use_ema=use_ema, ema_decay=ema_decay)
+        self._init_torchjd(
+            use_torchjd,
+            aggregation_method,
+            ctr_weight,
+            cvr_weight,
+            esmm,
+            sigmoid,
+            use_entropy_reg,
+            lambda_entropy,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+            use_asym_proj=use_asym_proj,
+            asym_proj_lambda=asym_proj_lambda,
+            asym_proj_tau=asym_proj_tau,
+            asym_proj_only_10=asym_proj_only_10,
+            asym_proj_restore_norm=asym_proj_restore_norm,
+            asym_proj_restore_max_scale=asym_proj_restore_max_scale,
+        )
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
@@ -1129,6 +1913,14 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
             cvr_out = torch.sum(expert_outputs * cvr_weights, dim=1)
 
             return self.ctr_tower(ctr_out), self.cvr_tower(cvr_out)
+
+    def _get_asym_proj_params(self):
+        # MMOE 仅在共享表示层（DCN 交叉层 + 共享专家）上做投影
+        params = []
+        if self.feature_cross is not None:
+            params.extend(list(self.feature_cross.parameters()))
+        params.extend(list(self.experts.parameters()))
+        return params
 
     def _build_hard_sample_weights(self, difficulty: torch.Tensor):
         """
@@ -1203,6 +1995,20 @@ class MMOEModel(_MultiTaskMixin, pl.LightningModule):
             self.log("train_hard_ratio", hard_ratio, on_step=False, on_epoch=True)
 
         return ctr_logits, cvr_logits, ctr_labels, cvr_labels, ctr_loss, cvr_loss, entropy_loss
+
+    def _compute_cvr_loss_vector(self, ctr_logits, cvr_logits, cvr_labels):
+        if self.esmm:
+            pCTR = torch.sigmoid(ctr_logits)
+            if self.sigmoid == 1:
+                pCVR = torch.sigmoid(cvr_logits)
+            else:
+                pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
+            return nn.functional.binary_cross_entropy(
+                pCTR * pCVR, cvr_labels.float(), reduction="none"
+            )
+        return nn.functional.binary_cross_entropy_with_logits(
+            cvr_logits, cvr_labels.float(), reduction="none"
+        )
 
 class PLEModel(_MultiTaskMixin, pl.LightningModule):
     """
@@ -1645,10 +2451,10 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
 
     def _training_step_standard(self, batch):
         (
-            _,
-            _,
-            _,
-            _,
+            ctr_logits,
+            cvr_logits,
+            ctr_labels,
+            cvr_labels,
             ctr_loss,
             cvr_loss,
             contrastive_loss,
@@ -1657,6 +2463,9 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
             hard_cvr_ratio,
         ) = self._compute_losses(batch, for_training=True)
 
+        self._monitor_task_gradient_conflict(
+            ctr_loss, cvr_loss, ctr_logits, cvr_logits, ctr_labels, cvr_labels
+        )
         loss = (
             self.ctr_weight * ctr_loss
             + self.cvr_weight * cvr_loss
@@ -1677,10 +2486,10 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
         optimizer.zero_grad()
 
         (
-            _,
-            _,
-            _,
-            _,
+            ctr_logits,
+            cvr_logits,
+            ctr_labels,
+            cvr_labels,
             ctr_loss,
             cvr_loss,
             contrastive_loss,
@@ -1689,6 +2498,9 @@ class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):
             hard_cvr_ratio,
         ) = self._compute_losses(batch, for_training=True)
 
+        self._monitor_task_gradient_conflict(
+            ctr_loss, cvr_loss, ctr_logits, cvr_logits, ctr_labels, cvr_labels
+        )
         backward([ctr_loss, cvr_loss], aggregator=self.aggregator)
         aux_loss = self.alpha_contrastive * contrastive_loss + self.lambda_rel * rel_loss
         aux_loss.backward()

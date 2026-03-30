@@ -58,6 +58,14 @@ def parse_args():
     # ── TorchJD 梯度聚合 ────────────────────────────────────────────────────
     parser.add_argument('--use_torchjd', action='store_true', default=False, help='是否启用 TorchJD 梯度聚合')
     parser.add_argument('--aggregation_method', type=str, default='upgrad', choices=['upgrad', 'mgda', 'pcgrad', 'graddrop'], help='TorchJD 聚合算法（use_torchjd=True 时生效）')
+    parser.add_argument('--use_asym_proj', action='store_true', default=False, help='是否启用非对称梯度投影（当前支持 ShareBottom / MMOE）')
+    parser.add_argument('--asym_proj_lambda', type=float, default=1.0, help='非对称投影强度 λ，1.0 为完整投影')
+    parser.add_argument('--asym_proj_tau', type=float, default=0.0, help='仅当 cos(g_ctr,g_ctcvr) < -tau 时触发投影')
+    parser.add_argument('--asym_proj_only_10', action='store_true', default=False, help='仅对 (click=1,purchase=0) 样本的 cvr/ctcvr 梯度做投影，其它样本梯度不投影')
+    parser.add_argument('--asym_proj_restore_norm', action='store_true', default=False, help='投影后将被投影分量的梯度模长恢复到投影前（仅作用于被投影分量）')
+    parser.add_argument('--asym_proj_restore_max_scale', type=float, default=5.0, help='模长恢复时的最大放大倍数上限')
+    parser.add_argument('--monitor_grad_conflict', action='store_true', default=False, help='是否动态监控任务梯度冲突（TorchJD autogram API）')
+    parser.add_argument('--grad_conflict_interval', type=int, default=100, help='梯度冲突监控间隔（每 N 个 step 监控一次）')
 
     # ── Entropy 正则化（防止门控极化）────────────────────────────────────────
     parser.add_argument('--use_entropy_reg', action='store_true', default=False, help='是否启用 Entropy 正则化防止门控极化')
@@ -100,12 +108,17 @@ def parse_args():
     # ── 数据加载 ────────────────────────────────────────────────────────────
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--train_subset_frac', type=float, default=1.0, help='训练集子采样比例，用于参数选择（默认 1.0=全量）')
+    parser.add_argument('--train_subset_seed', type=int, default=42, help='训练集子采样随机种子')
+    parser.add_argument('--train_subset_stratify', action='store_true', default=False, help='训练集子采样时是否按 (click,purchase) 分层抽样')
 
     # ── 训练配置 ────────────────────────────────────────────────────────────
     parser.add_argument('--max_epochs', type=int, default=100)
     parser.add_argument('--accelerator', type=str, default='gpu')
     parser.add_argument('--devices', type=int, default=4)
     parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_false')
+    parser.add_argument('--gradient_clip_val', type=float, default=0.0, help='梯度裁剪阈值，<=0 表示关闭')
+    parser.add_argument('--gradient_clip_algorithm', type=str, default='norm', choices=['norm', 'value'], help='梯度裁剪方式')
     parser.add_argument('--log_every_n_steps', type=int, default=100)
     parser.add_argument('--early_stop_patience', type=int, default=2)
 
@@ -119,6 +132,23 @@ def parse_args():
 def build_model(args):
     """根据 args 构造对应模型实例"""
     model_cls = MODEL_MAP[args.model]
+
+    if args.use_torchjd and args.use_asym_proj:
+        raise ValueError("use_torchjd 与 use_asym_proj 不能同时启用")
+    if args.use_asym_proj and args.model not in {'share_bottom', 'mmoe'}:
+        raise ValueError("use_asym_proj 当前仅支持 model in {share_bottom, mmoe}")
+    if args.asym_proj_only_10 and not args.use_asym_proj:
+        raise ValueError("asym_proj_only_10 仅在 use_asym_proj=True 时生效")
+    if args.asym_proj_restore_norm and not args.use_asym_proj:
+        raise ValueError("asym_proj_restore_norm 仅在 use_asym_proj=True 时生效")
+    if args.asym_proj_restore_max_scale < 1.0:
+        raise ValueError("asym_proj_restore_max_scale 需 >= 1.0")
+    if args.use_asym_proj and args.model == 'mmoe' and args.use_hard_sample:
+        raise ValueError("当前 mmoe + use_asym_proj 暂不支持 use_hard_sample")
+    if args.gradient_clip_val < 0.0:
+        raise ValueError("gradient_clip_val 需 >= 0.0")
+    if not (0.0 < args.train_subset_frac <= 1.0):
+        raise ValueError("train_subset_frac 需在 (0, 1] 区间")
 
     sparse_feature_names = USER_SPARSE + ITEM_SPARSE + ID_FEATURES + CONTEXT_SPARSE + CROSS_SPARSE
     dense_feature_names  = USER_DENSE + ITEM_DENSE + CROSS_DENSE
@@ -150,7 +180,16 @@ def build_model(args):
 
     # ShareBottom 专用参数
     if args.model == 'share_bottom':
-        return model_cls(**common, shared_hidden_dims=args.shared_hidden_dims)
+        return model_cls(
+            **common,
+            shared_hidden_dims=args.shared_hidden_dims,
+            use_asym_proj=args.use_asym_proj,
+            asym_proj_lambda=args.asym_proj_lambda,
+            asym_proj_tau=args.asym_proj_tau,
+            asym_proj_only_10=args.asym_proj_only_10,
+            asym_proj_restore_norm=args.asym_proj_restore_norm,
+            asym_proj_restore_max_scale=args.asym_proj_restore_max_scale,
+        )
 
     # PLE 专用参数
     if args.model in PLE_MODELS:
@@ -187,6 +226,12 @@ def build_model(args):
             **common,
             num_experts        = args.num_experts,
             expert_hidden_dims = args.expert_hidden_dims,
+            use_asym_proj      = args.use_asym_proj,
+            asym_proj_lambda   = args.asym_proj_lambda,
+            asym_proj_tau      = args.asym_proj_tau,
+            asym_proj_only_10  = args.asym_proj_only_10,
+            asym_proj_restore_norm = args.asym_proj_restore_norm,
+            asym_proj_restore_max_scale = args.asym_proj_restore_max_scale,
             use_hard_sample       = args.use_hard_sample,
             hard_sample_ratio     = args.hard_sample_ratio,
             hard_sample_weight    = args.hard_sample_weight,
@@ -215,13 +260,43 @@ def train_rank(args):
         label_cols           = ['click', 'purchase'],
         batch_size           = args.batch_size,
         num_workers          = args.num_workers,
+        train_subset_frac    = args.train_subset_frac,
+        train_subset_seed    = args.train_subset_seed,
+        train_subset_stratify= args.train_subset_stratify,
     )
 
     model = build_model(args)
+    if hasattr(model, "configure_grad_conflict_monitor"):
+        model.configure_grad_conflict_monitor(
+            enabled=args.monitor_grad_conflict,
+            interval=args.grad_conflict_interval,
+        )
 
-    # 实验名：模型名 + 是否使用 torchjd（若是则加聚合方法）
+    # 实验名：模型名 + 训练策略后缀
     jd_suffix = f"_jd_{args.aggregation_method}" if args.use_torchjd else ""
-    exp_name  = f"{args.model}{jd_suffix}"
+    if args.use_asym_proj:
+        lam = str(args.asym_proj_lambda).replace('.', 'p')
+        tau = str(args.asym_proj_tau).replace('.', 'p')
+        scope = "_on10" if args.asym_proj_only_10 else ""
+        if args.asym_proj_restore_norm:
+            rmax = str(args.asym_proj_restore_max_scale).replace('.', 'p')
+            restore = f"_rn_m{rmax}"
+        else:
+            restore = ""
+        asym_suffix = f"_asymproj_l{lam}_t{tau}{scope}{restore}"
+    else:
+        asym_suffix = ""
+    conflict_suffix = f"_gconf_i{args.grad_conflict_interval}" if args.monitor_grad_conflict else ""
+    clip_suffix = ""
+    if args.gradient_clip_val > 0.0:
+        clip_val = str(args.gradient_clip_val).replace('.', 'p')
+        clip_suffix = f"_gclip_{args.gradient_clip_algorithm}_{clip_val}"
+    subset_suffix = ""
+    if args.train_subset_frac < 1.0:
+        frac_tag = str(args.train_subset_frac).replace('.', 'p')
+        strat_tag = "_strat" if args.train_subset_stratify else ""
+        subset_suffix = f"_sub{frac_tag}{strat_tag}"
+    exp_name  = f"{args.model}{jd_suffix}{asym_suffix}{conflict_suffix}{clip_suffix}{subset_suffix}"
     exp_dir   = Path(args.exp_dir) / exp_name
 
     checkpoint_callback = ModelCheckpoint(
@@ -249,6 +324,8 @@ def train_rank(args):
         callbacks           = [checkpoint_callback, early_stop_callback],
         logger              = logger,
         log_every_n_steps   = args.log_every_n_steps,
+        gradient_clip_val   = args.gradient_clip_val if args.gradient_clip_val > 0.0 else None,
+        gradient_clip_algorithm = args.gradient_clip_algorithm,
         fast_dev_run        = False,
     )
 

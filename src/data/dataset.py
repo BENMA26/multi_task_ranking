@@ -80,6 +80,9 @@ class RankDataModule(pl.LightningDataModule):
         pin_memory: bool = True,
         val_ratio: float = 0.1,
         seed: int = 42,
+        train_subset_frac: float = 1.0,
+        train_subset_seed: int = 42,
+        train_subset_stratify: bool = False,
     ):
         super().__init__()
 
@@ -102,6 +105,12 @@ class RankDataModule(pl.LightningDataModule):
         self.pin_memory     = pin_memory
         self.val_ratio      = val_ratio
         self.seed           = seed
+        self.train_subset_frac = float(train_subset_frac)
+        self.train_subset_seed = int(train_subset_seed)
+        self.train_subset_stratify = bool(train_subset_stratify)
+
+        if not (0.0 < self.train_subset_frac <= 1.0):
+            raise ValueError("train_subset_frac 必须在 (0, 1] 区间")
 
         # Dataset 占位
         self.train_dataset = None
@@ -140,6 +149,45 @@ class RankDataModule(pl.LightningDataModule):
             drop_last=drop_last,
         )
 
+    def _apply_train_subset(self, train_df: pd.DataFrame) -> pd.DataFrame:
+        """可选地对训练集做子采样，用于快速参数选择。"""
+        frac = self.train_subset_frac
+        if frac >= 1.0:
+            return train_df
+
+        target_n = max(1, int(len(train_df) * frac))
+        rs = self.train_subset_seed
+
+        if not self.train_subset_stratify:
+            return train_df.sample(n=target_n, random_state=rs).reset_index(drop=True)
+
+        stratify_cols = [c for c in ("click", "purchase") if c in train_df.columns]
+        if len(stratify_cols) == 0:
+            return train_df.sample(n=target_n, random_state=rs).reset_index(drop=True)
+
+        pieces = []
+        grouped = train_df.groupby(stratify_cols, dropna=False, sort=False)
+        for _, group_df in grouped:
+            n = max(1, int(round(len(group_df) * frac)))
+            n = min(n, len(group_df))
+            pieces.append(group_df.sample(n=n, random_state=rs))
+
+        subset_df = pd.concat(pieces, axis=0)
+
+        # 纠偏到精确目标条数，保证不同实验间可比性
+        if len(subset_df) > target_n:
+            subset_df = subset_df.sample(n=target_n, random_state=rs)
+        elif len(subset_df) < target_n:
+            remain_df = train_df.drop(subset_df.index, errors="ignore")
+            add_n = min(target_n - len(subset_df), len(remain_df))
+            if add_n > 0:
+                subset_df = pd.concat(
+                    [subset_df, remain_df.sample(n=add_n, random_state=rs)],
+                    axis=0,
+                )
+
+        return subset_df.sample(frac=1.0, random_state=rs).reset_index(drop=True)
+
     def setup(self, stage: Optional[str] = None):
 
         if stage in ('fit', None):
@@ -161,7 +209,15 @@ class RankDataModule(pl.LightningDataModule):
                 train_df = train_df.drop(val_df.index).reset_index(drop=True)
                 val_df   = val_df.reset_index(drop=True)
 
+            original_train_size = len(train_df)
+            train_df = self._apply_train_subset(train_df)
+
             print(f"📊 训练集: {len(train_df):,} 条")
+            if self.train_subset_frac < 1.0:
+                print(
+                    f"📊 训练集子采样: {len(train_df):,}/{original_train_size:,} "
+                    f"({100.0 * len(train_df) / max(1, original_train_size):.2f}%)"
+                )
             print(f"📊 验证集: {len(val_df):,} 条")
 
             self.train_dataset = self._make_dataset(train_df)

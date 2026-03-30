@@ -1,0 +1,24 @@
+# Large data and experiment artifacts
+dataset/
+experiments/**/logs/
+experiments/**/outputs/
+experiments/**/outputs_*/
+experiments/**/checkpoints/
+experiments/**/data/
+experiments/**/results/
+experiments/**/*.ckpt
+experiments/**/*.out
+experiments/**/*.err
+experiments/**/*.parquet
+experiments/**/*.csv
+experiments/**/*.tmp
+experiments/**/*.zip
+experiments/**/*.tar.gz
+experiments/**/events.out.tfevents.*
+
+# Python caches and build metadata
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/

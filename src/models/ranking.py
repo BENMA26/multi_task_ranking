@@ -1718,6 +1718,12 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
         lambda_entropy      : float     = 0.01,
         use_ema             : bool      = False,
         ema_decay           : float     = 0.999,
+        use_asym_proj       : bool      = False,
+        asym_proj_lambda    : float     = 1.0,
+        asym_proj_tau       : float     = 0.0,
+        asym_proj_only_10   : bool      = False,
+        asym_proj_restore_norm: bool    = False,
+        asym_proj_restore_max_scale: float = 5.0,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -1738,7 +1744,24 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_entropy_reg, lambda_entropy, use_ema=use_ema, ema_decay=ema_decay)
+        self._init_torchjd(
+            use_torchjd,
+            aggregation_method,
+            ctr_weight,
+            cvr_weight,
+            esmm,
+            sigmoid,
+            use_entropy_reg,
+            lambda_entropy,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+            use_asym_proj=use_asym_proj,
+            asym_proj_lambda=asym_proj_lambda,
+            asym_proj_tau=asym_proj_tau,
+            asym_proj_only_10=asym_proj_only_10,
+            asym_proj_restore_norm=asym_proj_restore_norm,
+            asym_proj_restore_max_scale=asym_proj_restore_max_scale,
+        )
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
@@ -1762,6 +1785,25 @@ class MOEModel(_MultiTaskMixin, pl.LightningModule):
             gate_weights = self.gate(x).unsqueeze(-1)  # [B, E, 1]
             expert_out = torch.sum(expert_outputs * gate_weights, dim=1)  # [B, d]
             return self.ctr_tower(expert_out), self.cvr_tower(expert_out)
+
+    def _get_asym_proj_params(self):
+        # MOE 的共享表示层 = 专家网络 + 共享门控
+        return list(self.experts.parameters()) + list(self.gate.parameters())
+
+    def _compute_cvr_loss_vector(self, ctr_logits, cvr_logits, cvr_labels):
+        if self.esmm:
+            pCTR = torch.sigmoid(ctr_logits)
+            if self.sigmoid == 1:
+                pCVR = torch.sigmoid(cvr_logits)
+            else:
+                pCVR = torch.sigmoid(cvr_logits) * torch.sigmoid(cvr_logits)
+            pCTCVR = pCTR * pCVR
+            return nn.functional.binary_cross_entropy(
+                pCTCVR, cvr_labels.float(), reduction="none"
+            )
+        return nn.functional.binary_cross_entropy_with_logits(
+            cvr_logits, cvr_labels.float(), reduction="none"
+        )
 
 class MMOEModel(_MultiTaskMixin, pl.LightningModule):
     """
@@ -2068,8 +2110,14 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
         aggregation_method   : str       = "upgrad",
         esmm                 : bool      = False,
         sigmoid              : int       = 1,
+        use_entropy_reg      : bool      = False,
+        lambda_entropy       : float     = 0.01,
         use_ema              : bool      = False,
         ema_decay            : float     = 0.999,
+        use_dcn              : bool      = False,
+        dcn_num_layers       : int       = 2,
+        dcn_dropout          : float     = 0.0,
+        dcn_rank             : int       = 0,
     ):
         pl.LightningModule.__init__(self)
         self.save_hyperparameters()
@@ -2096,15 +2144,39 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
             lvl_in = input_dim if level == 0 else expert_hidden_dims[-1]
 
             self.ctr_experts.append(nn.ModuleList([
-                Expert(lvl_in, expert_hidden_dims, dropout)
+                Expert(
+                    lvl_in,
+                    expert_hidden_dims,
+                    dropout,
+                    use_dcn=use_dcn,
+                    dcn_num_layers=dcn_num_layers,
+                    dcn_dropout=dcn_dropout,
+                    dcn_rank=dcn_rank,
+                )
                 for _ in range(num_specific_experts)
             ]))
             self.cvr_experts.append(nn.ModuleList([
-                Expert(lvl_in, expert_hidden_dims, dropout)
+                Expert(
+                    lvl_in,
+                    expert_hidden_dims,
+                    dropout,
+                    use_dcn=use_dcn,
+                    dcn_num_layers=dcn_num_layers,
+                    dcn_dropout=dcn_dropout,
+                    dcn_rank=dcn_rank,
+                )
                 for _ in range(num_specific_experts)
             ]))
             self.shared_experts.append(nn.ModuleList([
-                Expert(lvl_in, expert_hidden_dims, dropout)
+                Expert(
+                    lvl_in,
+                    expert_hidden_dims,
+                    dropout,
+                    use_dcn=use_dcn,
+                    dcn_num_layers=dcn_num_layers,
+                    dcn_dropout=dcn_dropout,
+                    dcn_rank=dcn_rank,
+                )
                 for _ in range(num_shared_experts)
             ]))
 
@@ -2122,7 +2194,18 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
         self.ctr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
         self.cvr_tower = Tower(expert_hidden_dims[-1], tower_hidden_dims, dropout)
 
-        self._init_torchjd(use_torchjd, aggregation_method, ctr_weight, cvr_weight, esmm, sigmoid, use_ema=use_ema, ema_decay=ema_decay)
+        self._init_torchjd(
+            use_torchjd,
+            aggregation_method,
+            ctr_weight,
+            cvr_weight,
+            esmm,
+            sigmoid,
+            use_entropy_reg=use_entropy_reg,
+            lambda_entropy=lambda_entropy,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+        )
         self._init_metrics()
 
     def _forward_logits(self, x: torch.Tensor, return_gate_entropy: bool = False):
@@ -2130,6 +2213,7 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
         ctr_in    = x
         cvr_in    = x
         shared_in = x
+        gate_entropies = []
 
         for level in range(self.num_levels):
             # 各类专家输出
@@ -2142,25 +2226,48 @@ class PLEModel(_MultiTaskMixin, pl.LightningModule):
 
             # CTR 提取：task-specific + shared
             ctr_candidates = torch.cat([ctr_specific_out, shared_out], dim=1) # [B, ns+nsh, d]
-            ctr_weights    = self.ctr_gates[level](ctr_in).unsqueeze(-1)      # [B, ns+nsh, 1]
+            if return_gate_entropy:
+                ctr_weights_raw, ctr_entropy = self.ctr_gates[level](ctr_in, return_entropy=True)
+                gate_entropies.append(ctr_entropy)
+                ctr_weights = ctr_weights_raw.unsqueeze(-1)                   # [B, ns+nsh, 1]
+            else:
+                ctr_weights = self.ctr_gates[level](ctr_in).unsqueeze(-1)     # [B, ns+nsh, 1]
             new_ctr        = torch.sum(ctr_candidates * ctr_weights,  dim=1)  # [B, d]
 
             # CVR 提取：task-specific + shared
             cvr_candidates = torch.cat([cvr_specific_out, shared_out], dim=1)
-            cvr_weights    = self.cvr_gates[level](cvr_in).unsqueeze(-1)
+            if return_gate_entropy:
+                cvr_weights_raw, cvr_entropy = self.cvr_gates[level](cvr_in, return_entropy=True)
+                gate_entropies.append(cvr_entropy)
+                cvr_weights = cvr_weights_raw.unsqueeze(-1)
+            else:
+                cvr_weights = self.cvr_gates[level](cvr_in).unsqueeze(-1)
             new_cvr        = torch.sum(cvr_candidates * cvr_weights,  dim=1)
 
             # Shared 提取：ctr_specific + cvr_specific + shared（非最后层）
             if level < self.num_levels - 1:
                 shared_candidates = torch.cat(
                     [ctr_specific_out, cvr_specific_out, shared_out], dim=1)  # [B, 2ns+nsh, d]
-                shared_weights    = self.shared_gates[level](shared_in).unsqueeze(-1)
+                if return_gate_entropy:
+                    shared_weights_raw, shared_entropy = self.shared_gates[level](shared_in, return_entropy=True)
+                    gate_entropies.append(shared_entropy)
+                    shared_weights = shared_weights_raw.unsqueeze(-1)
+                else:
+                    shared_weights = self.shared_gates[level](shared_in).unsqueeze(-1)
                 shared_in         = torch.sum(shared_candidates * shared_weights, dim=1)
 
             ctr_in = new_ctr
             cvr_in = new_cvr
 
-        return self.ctr_tower(ctr_in), self.cvr_tower(cvr_in)
+        ctr_logit = self.ctr_tower(ctr_in)
+        cvr_logit = self.cvr_tower(cvr_in)
+        if return_gate_entropy:
+            if len(gate_entropies) == 0:
+                avg_entropy = torch.zeros(ctr_logit.size(0), device=ctr_logit.device)
+            else:
+                avg_entropy = torch.stack(gate_entropies, dim=0).mean(dim=0)
+            return ctr_logit, cvr_logit, avg_entropy
+        return ctr_logit, cvr_logit
 
 
 class AdaFTRModel(_MultiTaskMixin, pl.LightningModule):

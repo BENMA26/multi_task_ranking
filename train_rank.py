@@ -6,7 +6,6 @@ import argparse
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
-import pandas as pd
 from pathlib import Path
 
 from src.models.ranking import ShareBottomModel, MOEModel, MMOEModel, PLEModel, AdaFTRModel
@@ -33,6 +32,12 @@ EXPERT_MODELS = {'moe', 'mmoe', 'ple', 'adaftr'}
 # 仅 PLE 有的参数
 PLE_MODELS = {'ple'}
 
+# 训练能力支持范围
+ENTROPY_MODELS = {'moe', 'mmoe', 'ple'}
+ASYM_PROJ_MODELS = {'share_bottom', 'moe', 'mmoe'}
+DCN_MODELS = {'share_bottom', 'mmoe', 'ple', 'adaftr'}
+HARD_SAMPLE_MODELS = {'mmoe', 'adaftr'}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='排序模型训练脚本')
@@ -58,7 +63,7 @@ def parse_args():
     # ── TorchJD 梯度聚合 ────────────────────────────────────────────────────
     parser.add_argument('--use_torchjd', action='store_true', default=False, help='是否启用 TorchJD 梯度聚合')
     parser.add_argument('--aggregation_method', type=str, default='upgrad', choices=['upgrad', 'mgda', 'pcgrad', 'graddrop'], help='TorchJD 聚合算法（use_torchjd=True 时生效）')
-    parser.add_argument('--use_asym_proj', action='store_true', default=False, help='是否启用非对称梯度投影（当前支持 ShareBottom / MMOE）')
+    parser.add_argument('--use_asym_proj', action='store_true', default=False, help='是否启用非对称梯度投影（当前支持 ShareBottom / MOE / MMOE）')
     parser.add_argument('--asym_proj_lambda', type=float, default=1.0, help='非对称投影强度 λ，1.0 为完整投影')
     parser.add_argument('--asym_proj_tau', type=float, default=0.0, help='仅当 cos(g_ctr,g_ctcvr) < -tau 时触发投影')
     parser.add_argument('--asym_proj_only_10', action='store_true', default=False, help='仅对 (click=1,purchase=0) 样本的 cvr/ctcvr 梯度做投影，其它样本梯度不投影')
@@ -76,7 +81,7 @@ def parse_args():
     parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA 衰减系数')
 
     # ── DCN-v2 特征交叉 ─────────────────────────────────────────────────────
-    parser.add_argument('--use_dcn', action='store_true', default=False, help='是否在特征编码后加 DCN-v2 交叉层（ShareBottom/MMOE 生效）')
+    parser.add_argument('--use_dcn', action='store_true', default=False, help='是否在特征编码后加 DCN-v2 交叉层（当前支持 ShareBottom/MMOE/PLE/AdaFTR）')
     parser.add_argument('--dcn_num_layers', type=int, default=2, help='DCN-v2 交叉层数量')
     parser.add_argument('--dcn_dropout', type=float, default=0.0, help='DCN-v2 交叉层 Dropout')
     parser.add_argument('--dcn_rank', type=int, default=0, help='DCN-v2 低秩分解维度，0 表示全秩')
@@ -85,7 +90,7 @@ def parse_args():
     parser.add_argument('--shared_hidden_dims', type=int, nargs='+', default=[256, 128], help='共享底层各隐层维度（仅 share_bottom 有效）')
 
     # ── MOE / MMOE / PLE 专用 ──────────────────────────────────────────────
-    parser.add_argument('--num_experts', type=int, default=6, help='专家数量（仅 moe / mmoe 有效）')
+    parser.add_argument('--num_experts', type=int, default=6, help='专家数量（moe / mmoe / adaftr）')
     parser.add_argument('--expert_hidden_dims', type=int, nargs='+', default=[256, 128], help='每个专家网络各隐层维度（moe / mmoe / ple 有效）')
 
     # ── PLE 专用 ────────────────────────────────────────────────────────────
@@ -121,6 +126,7 @@ def parse_args():
     parser.add_argument('--gradient_clip_algorithm', type=str, default='norm', choices=['norm', 'value'], help='梯度裁剪方式')
     parser.add_argument('--log_every_n_steps', type=int, default=100)
     parser.add_argument('--early_stop_patience', type=int, default=2)
+    parser.add_argument('--seed', type=int, default=42, help='训练随机种子（模型初始化 / dataloader worker）')
 
     # ── 输出路径 ────────────────────────────────────────────────────────────
     parser.add_argument('--exp_dir', type=str, default='experiments/rank',
@@ -135,8 +141,8 @@ def build_model(args):
 
     if args.use_torchjd and args.use_asym_proj:
         raise ValueError("use_torchjd 与 use_asym_proj 不能同时启用")
-    if args.use_asym_proj and args.model not in {'share_bottom', 'mmoe'}:
-        raise ValueError("use_asym_proj 当前仅支持 model in {share_bottom, mmoe}")
+    if args.use_asym_proj and args.model not in ASYM_PROJ_MODELS:
+        raise ValueError(f"use_asym_proj 当前仅支持 model in {sorted(ASYM_PROJ_MODELS)}")
     if args.asym_proj_only_10 and not args.use_asym_proj:
         raise ValueError("asym_proj_only_10 仅在 use_asym_proj=True 时生效")
     if args.asym_proj_restore_norm and not args.use_asym_proj:
@@ -145,6 +151,14 @@ def build_model(args):
         raise ValueError("asym_proj_restore_max_scale 需 >= 1.0")
     if args.use_asym_proj and args.model == 'mmoe' and args.use_hard_sample:
         raise ValueError("当前 mmoe + use_asym_proj 暂不支持 use_hard_sample")
+    if args.use_entropy_reg and args.model not in ENTROPY_MODELS:
+        raise ValueError(f"use_entropy_reg 当前仅支持 model in {sorted(ENTROPY_MODELS)}")
+    if args.lambda_entropy < 0.0:
+        raise ValueError("lambda_entropy 需 >= 0.0")
+    if args.use_dcn and args.model not in DCN_MODELS:
+        raise ValueError(f"use_dcn 当前仅支持 model in {sorted(DCN_MODELS)}")
+    if args.use_hard_sample and args.model not in HARD_SAMPLE_MODELS:
+        raise ValueError(f"use_hard_sample 当前仅支持 model in {sorted(HARD_SAMPLE_MODELS)}")
     if args.gradient_clip_val < 0.0:
         raise ValueError("gradient_clip_val 需 >= 0.0")
     if not (0.0 < args.train_subset_frac <= 1.0):
@@ -153,7 +167,7 @@ def build_model(args):
     sparse_feature_names = USER_SPARSE + ITEM_SPARSE + ID_FEATURES + CONTEXT_SPARSE + CROSS_SPARSE
     dense_feature_names  = USER_DENSE + ITEM_DENSE + CROSS_DENSE
 
-    # 所有模型共有的参数
+    # 所有模型共有参数（仅包含各模型都支持的字段）
     common = dict(
         sparse_feature_names = sparse_feature_names,
         sparse_feature_dims  = vocabulary_size,
@@ -168,14 +182,8 @@ def build_model(args):
         aggregation_method   = args.aggregation_method,
         esmm                 = args.esmm,
         sigmoid              = args.sigmoid,
-        use_entropy_reg      = args.use_entropy_reg,
-        lambda_entropy       = args.lambda_entropy,
         use_ema              = args.use_ema,
         ema_decay            = args.ema_decay,
-        use_dcn              = args.use_dcn,
-        dcn_num_layers       = args.dcn_num_layers,
-        dcn_dropout          = args.dcn_dropout,
-        dcn_rank             = args.dcn_rank,
     )
 
     # ShareBottom 专用参数
@@ -183,6 +191,12 @@ def build_model(args):
         return model_cls(
             **common,
             shared_hidden_dims=args.shared_hidden_dims,
+            use_entropy_reg=False,
+            lambda_entropy=0.0,
+            use_dcn=args.use_dcn,
+            dcn_num_layers=args.dcn_num_layers,
+            dcn_dropout=args.dcn_dropout,
+            dcn_rank=args.dcn_rank,
             use_asym_proj=args.use_asym_proj,
             asym_proj_lambda=args.asym_proj_lambda,
             asym_proj_tau=args.asym_proj_tau,
@@ -199,6 +213,12 @@ def build_model(args):
             num_specific_experts = args.num_specific_experts,
             num_shared_experts   = args.num_shared_experts,
             num_levels           = args.num_levels,
+            use_entropy_reg      = args.use_entropy_reg,
+            lambda_entropy       = args.lambda_entropy,
+            use_dcn              = args.use_dcn,
+            dcn_num_layers       = args.dcn_num_layers,
+            dcn_dropout          = args.dcn_dropout,
+            dcn_rank             = args.dcn_rank,
         )
 
     # AdaFTR 专用参数
@@ -214,6 +234,10 @@ def build_model(args):
             tau_max               = args.tau_max,
             relatedness_hidden_dim= args.relatedness_hidden_dim,
             lambda_rel            = args.lambda_rel,
+            use_dcn               = args.use_dcn,
+            dcn_num_layers        = args.dcn_num_layers,
+            dcn_dropout           = args.dcn_dropout,
+            dcn_rank              = args.dcn_rank,
             use_hard_sample       = args.use_hard_sample,
             hard_sample_ratio     = args.hard_sample_ratio,
             hard_sample_weight    = args.hard_sample_weight,
@@ -226,6 +250,12 @@ def build_model(args):
             **common,
             num_experts        = args.num_experts,
             expert_hidden_dims = args.expert_hidden_dims,
+            use_entropy_reg    = args.use_entropy_reg,
+            lambda_entropy     = args.lambda_entropy,
+            use_dcn            = args.use_dcn,
+            dcn_num_layers     = args.dcn_num_layers,
+            dcn_dropout        = args.dcn_dropout,
+            dcn_rank           = args.dcn_rank,
             use_asym_proj      = args.use_asym_proj,
             asym_proj_lambda   = args.asym_proj_lambda,
             asym_proj_tau      = args.asym_proj_tau,
@@ -238,15 +268,24 @@ def build_model(args):
             hard_sample_warmup_epochs = args.hard_sample_warmup_epochs,
         )
 
-    # MOE / MMOE 专用参数
+    # MOE 专用参数
     return model_cls(
         **common,
         num_experts        = args.num_experts,
         expert_hidden_dims = args.expert_hidden_dims,
+        use_entropy_reg    = args.use_entropy_reg,
+        lambda_entropy     = args.lambda_entropy,
+        use_asym_proj      = args.use_asym_proj,
+        asym_proj_lambda   = args.asym_proj_lambda,
+        asym_proj_tau      = args.asym_proj_tau,
+        asym_proj_only_10  = args.asym_proj_only_10,
+        asym_proj_restore_norm = args.asym_proj_restore_norm,
+        asym_proj_restore_max_scale = args.asym_proj_restore_max_scale,
     )
 
 
 def train_rank(args):
+    pl.seed_everything(args.seed, workers=True)
 
     sparse_feature_names = USER_SPARSE + ITEM_SPARSE + ID_FEATURES + CONTEXT_SPARSE + CROSS_SPARSE
     dense_feature_names  = USER_DENSE + ITEM_DENSE + CROSS_DENSE

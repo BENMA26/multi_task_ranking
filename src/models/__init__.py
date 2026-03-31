@@ -1,9 +1,8 @@
 # 排序模型
 from src.models.ranking import (
     ShareBottomModel,
-    MOEModel,
     MMOEModel,
-    PLEModel
+    PLEModel,
 )
 
 # 特征工程
@@ -12,7 +11,6 @@ from src.models.features import SparseFeature, DenseFeature, SequenceFeature, Fe
 __all__ = [
     # 排序模型
     'ShareBottomModel',
-    'MOEModel',
     'MMOEModel',
     'PLEModel',
     # 特征工程
@@ -22,4 +20,3 @@ __all__ = [
     'FeatureEmbedding',
     'FeatureEncoder',
 ]
-

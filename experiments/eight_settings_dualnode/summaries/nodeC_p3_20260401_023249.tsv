@@ -1,0 +1,5 @@
+setting	seed	status	log_file
+07_mmoe_entropy_asym_on10	42	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeC_p3_20260401_023249/07_mmoe_entropy_asym_on10_s42.log
+07_mmoe_entropy_asym_on10	2027	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeC_p3_20260401_023249/07_mmoe_entropy_asym_on10_s2027.log
+08_mmoe_entropy_asym_on10_restore_norm	42	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeC_p3_20260401_023249/08_mmoe_entropy_asym_on10_restore_norm_s42.log
+08_mmoe_entropy_asym_on10_restore_norm	2027	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeC_p3_20260401_023249/08_mmoe_entropy_asym_on10_restore_norm_s2027.log

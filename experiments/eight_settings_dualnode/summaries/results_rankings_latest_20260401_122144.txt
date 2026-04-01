@@ -1,0 +1,29 @@
+== Rank by mean test_ctcvr ==
+03_mmoe_entropy	0.406705514
+06_mmoe_entropy_asym_all	0.406054407
+08_mmoe_entropy_asym_on10_restore_norm	0.405720979
+07_mmoe_entropy_asym_on10	0.405283242
+01_share_bottom	0.402368918
+04_mmoe_entropy_upgrad_all	0.401905462
+02_mmoe	0.395922408
+05_mmoe_entropy_upgrad_on10	0.395061329
+
+== Rank by mean test_ctr ==
+01_share_bottom	0.618118852
+07_mmoe_entropy_asym_on10	0.617874473
+08_mmoe_entropy_asym_on10_restore_norm	0.617699623
+03_mmoe_entropy	0.617619574
+06_mmoe_entropy_asym_all	0.617426991
+05_mmoe_entropy_upgrad_on10	0.616009057
+04_mmoe_entropy_upgrad_all	0.615951300
+02_mmoe	0.614763618
+
+== Rank by mean test_cvr ==
+03_mmoe_entropy	0.658505976
+06_mmoe_entropy_asym_all	0.657656759
+08_mmoe_entropy_asym_on10_restore_norm	0.656828731
+07_mmoe_entropy_asym_on10	0.655931354
+04_mmoe_entropy_upgrad_all	0.652493179
+01_share_bottom	0.650957227
+02_mmoe	0.643996090
+05_mmoe_entropy_upgrad_on10	0.641322434

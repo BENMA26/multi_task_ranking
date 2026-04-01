@@ -1,0 +1,7 @@
+setting	seed	status	log_file
+04_mmoe_entropy_upgrad_all	42	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeB_p2_20260401_023144/04_mmoe_entropy_upgrad_all_s42.log
+04_mmoe_entropy_upgrad_all	2027	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeB_p2_20260401_023144/04_mmoe_entropy_upgrad_all_s2027.log
+05_mmoe_entropy_upgrad_on10	42	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeB_p2_20260401_023144/05_mmoe_entropy_upgrad_on10_s42.log
+05_mmoe_entropy_upgrad_on10	2027	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeB_p2_20260401_023144/05_mmoe_entropy_upgrad_on10_s2027.log
+06_mmoe_entropy_asym_all	42	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeB_p2_20260401_023144/06_mmoe_entropy_asym_all_s42.log
+06_mmoe_entropy_asym_all	2027	OK	/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/logs/nodeB_p2_20260401_023144/06_mmoe_entropy_asym_all_s2027.log

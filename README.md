@@ -381,57 +381,25 @@ Together, these form a coherent optimization strategy for CTR/CVR/CTCVR training
 
 ---
 
-## 8. Experimental Results (Current Snapshot)
+## 8. Experimental Results (Corrected)
 
-### 8.1 Data source and scope
+### 8.1 Correction Note
 
-This snapshot is computed from completed 2-seed runs (seed=42, 2027) for all 8 settings:
+The previously reported `test CTCVR` values around `0.4x` were **incorrect for true CTCVR evaluation** and have been removed.
 
-- run-level table:
-  - `experiments/eight_settings_dualnode/summaries/results_with_best_ckpt_ctcvr_latest_20260401_122144.tsv`
-- setting-level summary:
-  - `experiments/eight_settings_dualnode/summaries/results_with_best_ckpt_ctcvr_by_setting_latest_20260401_122144.tsv`
-- ranking file:
-  - `experiments/eight_settings_dualnode/summaries/results_rankings_latest_20260401_122144.txt`
+That old number was a factorized proxy (`CTR_AUC * CVR_AUC`), not:
 
-Note:
-- extra-seed jobs (`seed=3407`) are still running and are not included in this snapshot.
+- true `CTCVR AUC` on full exposure, using `sigmoid(ctr) * sigmoid(cvr)` vs `purchase`.
 
-### 8.2 Setting-level mean +/- std (n=2 per setting)
+### 8.2 Source of Truth
 
-| setting | test CTR (mean +/- std) | test CVR (mean +/- std) | test CTCVR (mean +/- std) |
-|---|---:|---:|---:|
-| 01_share_bottom | 0.618118852 +/- 0.000156238 | 0.650957227 +/- 0.000283143 | 0.402368918 +/- 0.000073314 |
-| 02_mmoe | 0.614763618 +/- 0.003471804 | 0.643996090 +/- 0.009822281 | 0.395922408 +/- 0.008274206 |
-| 03_mmoe_entropy | 0.617619574 +/- 0.000248414 | 0.658505976 +/- 0.005440062 | 0.406705514 +/- 0.003196312 |
-| 04_mmoe_entropy_upgrad_all | 0.615951300 +/- 0.000458052 | 0.652493179 +/- 0.006262263 | 0.401905462 +/- 0.004156122 |
-| 05_mmoe_entropy_upgrad_on10 | 0.616009057 +/- 0.000291150 | 0.641322434 +/- 0.006247090 | 0.395061329 +/- 0.004034992 |
-| 06_mmoe_entropy_asym_all | 0.617426991 +/- 0.000282047 | 0.657656759 +/- 0.004514644 | 0.406054407 +/- 0.002601978 |
-| 07_mmoe_entropy_asym_on10 | 0.617874473 +/- 0.000098666 | 0.655931354 +/- 0.000063895 | 0.405283242 +/- 0.000025246 |
-| 08_mmoe_entropy_asym_on10_restore_norm | 0.617699623 +/- 0.000755440 | 0.656828731 +/- 0.004971179 | 0.405720979 +/- 0.002574498 |
+Please use the auto-generated section below as the authoritative result table:
 
-### 8.3 Rankings (by mean AUC)
+- `Historical Best Checkpoint True Test CTCVR AUC (Exclude seed=3407)`
 
-- By test CTCVR:
-  1. `03_mmoe_entropy` (0.406705514)
-  2. `06_mmoe_entropy_asym_all` (0.406054407)
-  3. `08_mmoe_entropy_asym_on10_restore_norm` (0.405720979)
+It is computed from completed checkpoints and explicitly excludes `seed=3407` as requested.
 
-- By test CTR:
-  1. `01_share_bottom` (0.618118852)
-  2. `07_mmoe_entropy_asym_on10` (0.617874473)
-  3. `08_mmoe_entropy_asym_on10_restore_norm` (0.617699623)
-
-- By test CVR:
-  1. `03_mmoe_entropy` (0.658505976)
-  2. `06_mmoe_entropy_asym_all` (0.657656759)
-  3. `08_mmoe_entropy_asym_on10_restore_norm` (0.656828731)
-
-### 8.4 Quick interpretation
-
-- If optimizing CTCVR first, current best is `03_mmoe_entropy`, with `06_mmoe_entropy_asym_all` very close.
-- `01_share_bottom` remains strongest on CTR only, but lags in CTCVR.
-- Asymmetric projection variants improve CTCVR/CVR while preserving strong CTR.
+---
 
 <!-- AUTO_TRUE_CTCVR_AUDIT:START -->
 ## Historical Best Checkpoint True Test CTCVR AUC (Exclude seed=3407)

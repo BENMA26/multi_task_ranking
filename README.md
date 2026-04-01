@@ -381,37 +381,16 @@ Together, these form a coherent optimization strategy for CTR/CVR/CTCVR training
 
 ---
 
-## 8. Experimental Results (Corrected)
+## 8. Experimental Results
 
-### 8.1 Correction Note
+### 8.1 Evaluation Protocol
 
-The previously reported `test CTCVR` values around `0.4x` were **incorrect for true CTCVR evaluation** and have been removed.
+- Metric definition (true CTCVR AUC): `AUROC(sigmoid(ctr) * sigmoid(cvr), purchase)` on full test exposure.
+- Aggregation: mean +/- std over seeds `42` and `2027` (seed `3407` excluded).
+- Run-level source: `/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/summaries/historical_best_true_test_ctcvr_run_level_exclude_seed3407_20260401_155348.tsv`
+- Setting-level source: `/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/summaries/historical_best_true_test_ctcvr_by_setting_exclude_seed3407_20260401_155348.tsv`
 
-That old number was a factorized proxy (`CTR_AUC * CVR_AUC`), not:
-
-- true `CTCVR AUC` on full exposure, using `sigmoid(ctr) * sigmoid(cvr)` vs `purchase`.
-
-### 8.2 Source of Truth
-
-Please use the auto-generated section below as the authoritative result table:
-
-- `Historical Best Checkpoint True Test CTCVR AUC (Exclude seed=3407)`
-
-It is computed from completed checkpoints and explicitly excludes `seed=3407` as requested.
-
----
-
-<!-- AUTO_TRUE_CTCVR_AUDIT:START -->
-## Historical Best Checkpoint True Test CTCVR AUC (Exclude seed=3407)
-
-- Generated at: 2026-04-01 15:53:48
-- Evaluated checkpoints (seed != 3407): 16
-- Excluded seeds: `3407`
-- Source run-level TSV: `/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/summaries/historical_best_true_test_ctcvr_run_level_20260401_155104.tsv`
-- Filtered run-level TSV: `/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/summaries/historical_best_true_test_ctcvr_run_level_exclude_seed3407_20260401_155348.tsv`
-- Filtered setting-level TSV: `/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/summaries/historical_best_true_test_ctcvr_by_setting_exclude_seed3407_20260401_155348.tsv`
-
-### Setting Summary (mean +/- std)
+### 8.2 Main Results (mean +/- std)
 
 | setting | n | test CTR | test CVR | true test CTCVR |
 |---|---:|---:|---:|---:|
@@ -424,21 +403,25 @@ It is computed from completed checkpoints and explicitly excludes `seed=3407` as
 | 07_mmoe_entropy_asym_on10 | 2 | 0.618429750 +/- 0.000116031 | 0.655711144 +/- 0.001342588 | 0.625751048 +/- 0.003664879 |
 | 08_mmoe_entropy_asym_on10_restore_norm | 2 | 0.618314773 +/- 0.000501927 | 0.656638562 +/- 0.003283155 | 0.626619398 +/- 0.004531039 |
 
-### Top by true test CTCVR
+### 8.3 Rankings (Top-3 by mean AUC)
 
-1. `06_mmoe_entropy_asym_all`: 0.627968848
-2. `03_mmoe_entropy`: 0.627282858
-3. `08_mmoe_entropy_asym_on10_restore_norm`: 0.626619398
+- By true test CTCVR:
+  1. `06_mmoe_entropy_asym_all` (0.627968848)
+  2. `03_mmoe_entropy` (0.627282858)
+  3. `08_mmoe_entropy_asym_on10_restore_norm` (0.626619398)
 
-### Top by test CTR
+- By test CTR:
+  1. `01_share_bottom` (0.618634254)
+  2. `07_mmoe_entropy_asym_on10` (0.618429750)
+  3. `08_mmoe_entropy_asym_on10_restore_norm` (0.618314773)
 
-1. `01_share_bottom`: 0.618634254
-2. `07_mmoe_entropy_asym_on10`: 0.618429750
-3. `08_mmoe_entropy_asym_on10_restore_norm`: 0.618314773
+- By test CVR:
+  1. `08_mmoe_entropy_asym_on10_restore_norm` (0.656638562)
+  2. `06_mmoe_entropy_asym_all` (0.656572789)
+  3. `03_mmoe_entropy` (0.656404316)
 
-### Top by test CVR
+### 8.4 Executive Summary
 
-1. `08_mmoe_entropy_asym_on10_restore_norm`: 0.656638562
-2. `06_mmoe_entropy_asym_all`: 0.656572789
-3. `03_mmoe_entropy`: 0.656404316
-<!-- AUTO_TRUE_CTCVR_AUDIT:END -->
+- Best overall on true test CTCVR: `06_mmoe_entropy_asym_all` (0.627968848).
+- Highest test CTR: `01_share_bottom` (0.618634254).
+- Highest test CVR: `08_mmoe_entropy_asym_on10_restore_norm` (0.656638562).

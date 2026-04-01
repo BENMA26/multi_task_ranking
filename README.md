@@ -432,3 +432,45 @@ Note:
 - If optimizing CTCVR first, current best is `03_mmoe_entropy`, with `06_mmoe_entropy_asym_all` very close.
 - `01_share_bottom` remains strongest on CTR only, but lags in CTCVR.
 - Asymmetric projection variants improve CTCVR/CVR while preserving strong CTR.
+
+<!-- AUTO_TRUE_CTCVR_AUDIT:START -->
+## Historical Best Checkpoint True Test CTCVR AUC (Exclude seed=3407)
+
+- Generated at: 2026-04-01 15:53:48
+- Evaluated checkpoints (seed != 3407): 16
+- Excluded seeds: `3407`
+- Source run-level TSV: `/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/summaries/historical_best_true_test_ctcvr_run_level_20260401_155104.tsv`
+- Filtered run-level TSV: `/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/summaries/historical_best_true_test_ctcvr_run_level_exclude_seed3407_20260401_155348.tsv`
+- Filtered setting-level TSV: `/work/home/maben/project/rec_sys/projects/multi_task_ranking/experiments/eight_settings_dualnode/summaries/historical_best_true_test_ctcvr_by_setting_exclude_seed3407_20260401_155348.tsv`
+
+### Setting Summary (mean +/- std)
+
+| setting | n | test CTR | test CVR | true test CTCVR |
+|---|---:|---:|---:|---:|
+| 01_share_bottom | 2 | 0.618634254 +/- 0.000099340 | 0.653828502 +/- 0.000572691 | 0.623717546 +/- 0.004880774 |
+| 02_mmoe | 2 | 0.615213662 +/- 0.003619023 | 0.644661367 +/- 0.010047050 | 0.617410362 +/- 0.007081598 |
+| 03_mmoe_entropy | 2 | 0.618153036 +/- 0.000070385 | 0.656404316 +/- 0.005693617 | 0.627282858 +/- 0.001158027 |
+| 04_mmoe_entropy_upgrad_all | 2 | 0.616394877 +/- 0.000631023 | 0.652469397 +/- 0.003701505 | 0.622079015 +/- 0.000382019 |
+| 05_mmoe_entropy_upgrad_on10 | 2 | 0.616402387 +/- 0.000038944 | 0.643214166 +/- 0.006630542 | 0.614546866 +/- 0.009116743 |
+| 06_mmoe_entropy_asym_all | 2 | 0.617975950 +/- 0.000110678 | 0.656572789 +/- 0.002371140 | 0.627968848 +/- 0.004386897 |
+| 07_mmoe_entropy_asym_on10 | 2 | 0.618429750 +/- 0.000116031 | 0.655711144 +/- 0.001342588 | 0.625751048 +/- 0.003664879 |
+| 08_mmoe_entropy_asym_on10_restore_norm | 2 | 0.618314773 +/- 0.000501927 | 0.656638562 +/- 0.003283155 | 0.626619398 +/- 0.004531039 |
+
+### Top by true test CTCVR
+
+1. `06_mmoe_entropy_asym_all`: 0.627968848
+2. `03_mmoe_entropy`: 0.627282858
+3. `08_mmoe_entropy_asym_on10_restore_norm`: 0.626619398
+
+### Top by test CTR
+
+1. `01_share_bottom`: 0.618634254
+2. `07_mmoe_entropy_asym_on10`: 0.618429750
+3. `08_mmoe_entropy_asym_on10_restore_norm`: 0.618314773
+
+### Top by test CVR
+
+1. `08_mmoe_entropy_asym_on10_restore_norm`: 0.656638562
+2. `06_mmoe_entropy_asym_all`: 0.656572789
+3. `03_mmoe_entropy`: 0.656404316
+<!-- AUTO_TRUE_CTCVR_AUDIT:END -->
